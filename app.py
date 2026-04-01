@@ -357,6 +357,23 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # ── Paso 1b ──────────────────────────────────────────────────────────────
+    st.markdown("### Tipo de corpus")
+    descripcion_corpus = st.text_area(
+        "¿Qué tipo de documentos vas a analizar?",
+        placeholder=(
+            "Ej: sentencias de amparo indirecto en materia administrativa\n"
+            "Ej: contratos de arrendamiento comercial\n"
+            "Ej: laudos arbitrales en materia mercantil\n"
+            "Ej: resoluciones de órganos regulatorios"
+        ),
+        height=100,
+        key="descripcion_corpus",
+        help="Esta descripción le ayuda a Claude a entender el contexto de tus documentos."
+    )
+
+    st.markdown("---")
+
     # ── Paso 2 ───────────────────────────────────────────────────────────────
     st.markdown("### Paso 2 · Define tus patrones")
     st.caption(
@@ -366,15 +383,16 @@ with st.sidebar:
     patrones_txt = st.text_area(
         "Patrones a detectar:",
         placeholder=(
-            "Ej: El juez omite transcribir los conceptos de violación\n"
-            "Ej: La sentencia sobresee el amparo\n"
-            "Ej: El juez menciona falta de tóner o papel\n"
-            "Ej: Se rechaza un documento digital o con QR\n"
-            "Ej: El juez otorga valor al perito sin análisis crítico"
+            "Escribe un fenómeno por línea.\n\n"
+            "Ejemplos genéricos:\n"
+            "El documento omite justificar una decisión clave\n"
+            "Se menciona falta de recursos materiales\n"
+            "Se rechaza evidencia sin explicación\n"
+            "Se delega una decisión a un tercero sin análisis crítico"
         ),
         height=180,
         key="patrones_txt",
-        help="Estos patrones se convierten en preguntas sí/no para cada documento del corpus."
+        help="Describe en lenguaje natural los fenómenos que quieres detectar. Un patrón por línea."
     )
     patrones_lista = [l.strip() for l in patrones_txt.splitlines() if l.strip()]
     if patrones_lista:
@@ -553,10 +571,11 @@ def construir_esquema(patrones):
     return {f"patron_{i+1}": desc for i, desc in enumerate(patrones)}
 
 
-def indexar_documento(nombre, texto, ak, esquema):
+def indexar_documento(nombre, texto, ak, esquema, tipo_corpus="documentos"):
     """
     Extrae el JSON estructurado de un documento con Claude.
-    esquema = {"patron_1": "descripción…", "patron_2": "descripción…", …}
+    esquema      = {"patron_1": "descripción…", …}
+    tipo_corpus  = descripción del tipo de documentos (contexto para Claude)
     Usa los primeros 6 000 caracteres para minimizar costo.
     """
     h        = hashlib.md5(texto.encode("utf-8")).hexdigest()
@@ -566,8 +585,9 @@ def indexar_documento(nombre, texto, ak, esquema):
         f'  "{k}": bool,   // ¿{v}?'
         for k, v in esquema.items()
     )
+    ctx = tipo_corpus.strip() if tipo_corpus.strip() else "documentos"
     prompt = (
-        "Eres un asistente de análisis de documentos. "
+        f"Eres un asistente de análisis de {ctx}. "
         "Analiza el siguiente documento y responde ÚNICAMENTE con un objeto JSON.\n\n"
         "El JSON debe tener exactamente estas claves:\n"
         "{\n"
@@ -595,13 +615,13 @@ def indexar_documento(nombre, texto, ak, esquema):
     return datos
 
 
-def indexar_corpus_paralelo(corpus, ak, esquema, cb_progreso=None):
+def indexar_corpus_paralelo(corpus, ak, esquema, tipo_corpus="documentos", cb_progreso=None):
     """Indexa todo el corpus en paralelo con ThreadPoolExecutor (IA_WORKERS hilos)."""
     resultado   = {}
     total       = len(corpus)
     completados = 0
     with ThreadPoolExecutor(max_workers=IA_WORKERS) as ex:
-        futures = {ex.submit(indexar_documento, n, t, ak, esquema): n
+        futures = {ex.submit(indexar_documento, n, t, ak, esquema, tipo_corpus): n
                    for n, t in corpus.items()}
         for f in as_completed(futures):
             nombre       = futures[f]
@@ -884,7 +904,8 @@ with tab1:
                         text=f"Indexando {completados}/{total}: {nombre[:55]}"
                     )
 
-                nuevos = indexar_corpus_paralelo(pendientes_dict, api_key, esquema_actual, _cb)
+                tipo_c = st.session_state.get("descripcion_corpus", "documentos")
+                nuevos = indexar_corpus_paralelo(pendientes_dict, api_key, esquema_actual, tipo_c, _cb)
                 st.session_state.indice.update(nuevos)
                 st.session_state.esquema_guardado = esquema_actual
                 barra.empty()
