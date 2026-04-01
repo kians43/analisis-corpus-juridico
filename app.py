@@ -7,10 +7,13 @@ import hashlib
 import requests
 import pandas as pd
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CARPETA_TXT  = os.environ.get("CARPETA_TXT", r"C:\Users\kians\Desktop\sentencias individuales txt")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_HAIKU = "claude-haiku-4-5-20251001"   # para detección IA: 20× más rápido y barato
 CLAUDE_URL   = "https://api.anthropic.com/v1/messages"
+IA_WORKERS   = 8                              # llamadas paralelas a la API
 
 st.set_page_config(page_title="Análisis de Corpus Jurídico", layout="wide")
 
@@ -336,12 +339,12 @@ if "revisados" not in st.session_state:
     st.session_state.revisados = set()
 if "ultimo_resultado" not in st.session_state:
     st.session_state.ultimo_resultado = None
-if "ia_cache" not in st.session_state:
-    st.session_state.ia_cache = {}
-if "ia_resultados" not in st.session_state:
-    st.session_state.ia_resultados = []
+if "indice" not in st.session_state:
+    st.session_state.indice = {}
 if "ia_revisados" not in st.session_state:
     st.session_state.ia_revisados = set()
+if "ia_resultados_consulta" not in st.session_state:
+    st.session_state.ia_resultados_consulta = []
 
 with st.sidebar:
     st.header("⚙️ Configuración")
@@ -526,76 +529,129 @@ def identificar_referencias(texto, patrones_custom):
     return sorted(list(encontrados))
 
 
-# ── Funciones de detección IA ────────────────────────────────────────────────
+# ── Índice semántico estructurado ────────────────────────────────────────────
+# Esquema de extracción: cubre los 7 patrones identificados en la investigación.
+# Haiku llena este JSON por cada sentencia (una sola llamada por documento).
 
-def dividir_texto(texto, tamaño=1200):
-    """Divide el texto en fragmentos de tamaño fijo para enviar a Claude."""
-    return [texto[i:i+tamaño] for i in range(0, len(texto), tamaño)]
+CAMPOS_BOOLEANOS = [
+    ("omite_transcripcion_conceptos",        "Omite transcripción de conceptos/agravios"),
+    ("silencio_administrativo",              "Acto reclamado: silencio/omisión de autoridad"),
+    ("clausula_precariedad",                 "Cláusula de precariedad (tóner/papel)"),
+    ("rechazo_documento_digital",            "Rechazo de documento digital/QR"),
+    ("sesgo_negativa_autoridad",             "Sesgo: negativa de autoridad como verdad base"),
+    ("sobreseimiento",                       "Sentencia: sobreseimiento"),
+    ("delegacion_pericial_acritica",         "Delegación acrítica en perito"),
+    ("hecho_notorio_digital_sin_protocolo",  "Hecho notorio digital sin protocolo"),
+]
+
+_ESQUEMA_PROMPT = """{
+  "omite_transcripcion_conceptos": bool,
+  "justificacion_omision": "cita breve o ''",
+  "silencio_administrativo": bool,
+  "tipo_acto_reclamado": "descripción breve",
+  "clausula_precariedad": bool,
+  "texto_precariedad": "cita o ''",
+  "rechazo_documento_digital": bool,
+  "razon_rechazo_digital": "razón o ''",
+  "sesgo_negativa_autoridad": bool,
+  "sobreseimiento": bool,
+  "delegacion_pericial_acritica": bool,
+  "hecho_notorio_digital_sin_protocolo": bool,
+  "resolucion": "concede | niega | sobresee | otro",
+  "resumen": "máximo 2 oraciones del caso"
+}"""
 
 
-def filtrar_documentos(corpus, palabras_clave):
-    """Pre-filtro por palabras clave antes de llamar a la IA (sin costo de API)."""
-    if not palabras_clave:
-        return list(corpus.keys())
-    palabras_lower = [p.lower().strip() for p in palabras_clave if p.strip()]
-    return [nombre for nombre, texto in corpus.items()
-            if any(p in texto.lower() for p in palabras_lower)]
-
-
-def evaluar_chunk_con_ia(chunk, ak):
-    """Envía un fragmento a Claude y pregunta si contiene la omisión buscada."""
-    prompt = f"""Eres un asistente de análisis jurídico.
-Responde SOLO en JSON válido, sin texto adicional.
-
-¿Este texto contiene un caso donde el juez NO transcribe los conceptos de violación o agravios?
-
-Criterios de inclusión:
-* El juez declara que es innecesario transcribir los conceptos de violación o agravios
-* El juez omite la transcripción sin justificación expresa
-
-Criterios de exclusión:
-* El juez sí transcribe los conceptos de violación o agravios
-* Solo se menciona el término sin aplicarlo al caso concreto
-
-Formato de respuesta (JSON puro):
-{{"match": true/false, "fragmento": "cita textual breve del pasaje relevante, o cadena vacía si no hay match"}}
-
-Texto a analizar:
-\"\"\"{chunk}\"\"\""""
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": ak,
-        "anthropic-version": "2023-06-01"
-    }
-    body = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 256,
-        "messages": [{"role": "user", "content": prompt}]
-    }
+def indexar_documento(nombre, texto, ak):
+    """
+    Extrae el JSON estructurado de una sentencia con Haiku.
+    Solo usa los primeros 6 000 caracteres (~1 500 tokens) para minimizar costo.
+    Retorna el dict JSON más _hash y _documento.
+    """
+    h       = hashlib.md5(texto.encode("utf-8")).hexdigest()
+    extracto = texto[:6000]
+    prompt  = (
+        "Eres un asistente de análisis jurídico mexicano.\n"
+        "Analiza esta sentencia de amparo y extrae información estructurada.\n"
+        "Responde ÚNICAMENTE con un objeto JSON que tenga exactamente estas claves:\n\n"
+        f"{_ESQUEMA_PROMPT}\n\n"
+        "Reglas: bool → true/false en minúsculas; texto vacío → \"\"; "
+        "sin texto antes ni después del JSON.\n\n"
+        f"Sentencia (primeros 6 000 caracteres):\n\"\"\"\n{extracto}\n\"\"\""
+    )
+    headers = {"Content-Type": "application/json",
+               "x-api-key": ak, "anthropic-version": "2023-06-01"}
+    body    = {"model": CLAUDE_HAIKU, "max_tokens": 600,
+               "messages": [{"role": "user", "content": prompt}]}
     try:
-        r = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=30)
+        r    = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=30)
         r.raise_for_status()
-        raw = r.json()["content"][0]["text"].strip()
-        limpia = raw.strip("```json").strip("```").strip()
-        return json.loads(limpia)
-    except Exception:
-        return {"match": False, "fragmento": ""}
+        raw  = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
+        datos = json.loads(raw)
+    except Exception as e:
+        datos = {"_error": str(e)}
+    datos["_hash"]      = h
+    datos["_documento"] = nombre
+    return datos
 
 
-def procesar_documento(nombre, texto, ak, cache):
-    """Procesa un documento completo con early-stop y caché por hash."""
-    h = hashlib.md5(texto.encode("utf-8")).hexdigest()
-    if h in cache:
-        return cache[h]
-    for chunk in dividir_texto(texto):
-        resultado = evaluar_chunk_con_ia(chunk, ak)
-        if resultado.get("match"):
-            res = {"match": True, "fragmento": resultado.get("fragmento", "")}
-            cache[h] = res
-            return res
-    res = {"match": False, "fragmento": ""}
-    cache[h] = res
-    return res
+def indexar_corpus_paralelo(corpus, ak, cb_progreso=None):
+    """Indexa todo el corpus en paralelo con ThreadPoolExecutor (IA_WORKERS hilos)."""
+    resultado   = {}
+    total       = len(corpus)
+    completados = 0
+    with ThreadPoolExecutor(max_workers=IA_WORKERS) as ex:
+        futures = {ex.submit(indexar_documento, n, t, ak): n
+                   for n, t in corpus.items()}
+        for f in as_completed(futures):
+            nombre       = futures[f]
+            completados += 1
+            if cb_progreso:
+                cb_progreso(completados, total, nombre)
+            try:
+                resultado[nombre] = f.result()
+            except Exception as e:
+                resultado[nombre] = {"_documento": nombre, "_error": str(e)}
+    return resultado
+
+
+def consultar_indice(indice, consulta, ak):
+    """
+    Manda el índice completo a Haiku en lotes de 30 fichas.
+    Devuelve lista de {doc, razon} para los que coinciden con la consulta.
+    """
+    if not indice:
+        return []
+    entradas = []
+    for nombre, datos in indice.items():
+        ficha = {k: v for k, v in datos.items() if not k.startswith("_")}
+        ficha["_doc"] = nombre
+        entradas.append(ficha)
+
+    LOTE   = 30
+    matches = []
+    for i in range(0, len(entradas), LOTE):
+        lote_str = json.dumps(entradas[i:i+LOTE], ensure_ascii=False)
+        prompt   = (
+            f"Investigador busca: \"{consulta}\"\n\n"
+            f"Fichas de sentencias (JSON):\n{lote_str}\n\n"
+            "¿Cuáles fichas coinciden con la búsqueda? "
+            "Responde SOLO con JSON:\n"
+            "{\"matches\": [{\"doc\": \"nombre\", \"razon\": \"explicación breve\"}]}\n"
+            "Si ninguna coincide: {\"matches\": []}"
+        )
+        headers = {"Content-Type": "application/json",
+                   "x-api-key": ak, "anthropic-version": "2023-06-01"}
+        body    = {"model": CLAUDE_HAIKU, "max_tokens": 1200,
+                   "messages": [{"role": "user", "content": prompt}]}
+        try:
+            r   = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=30)
+            r.raise_for_status()
+            raw = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
+            matches.extend(json.loads(raw).get("matches", []))
+        except Exception:
+            pass
+    return matches
 
 
 def guardar_set(resultados):
@@ -621,186 +677,11 @@ def exportar_csv(nombres, corpus, terminos):
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["🔍 Búsqueda", "📊 Estadísticas", "🔗 Referencias", "📋 Historial", "🤖 Detección IA"]
+tab2, tab3, tab4, tab5 = st.tabs(
+    ["📊 Estadísticas", "🔗 Referencias", "📋 Historial", "📑 Índice IA"]
 )
 
-# ── TAB 1: BÚSQUEDA ─────────────────────────────────────────────────────────
-with tab1:
-    if not st.session_state.corpus:
-        st.warning("⬅️ Primero carga los TXT desde el panel izquierdo.")
-    else:
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            consulta = st.text_area(
-                "Escribe tu consulta en lenguaje natural:",
-                placeholder=(
-                    "Ej: documentos donde no se motiva la decisión\n"
-                    "Ej: contratos con cláusula de rescisión anticipada\n"
-                    "Ej: resoluciones que citan el artículo 16 constitucional"
-                ),
-                height=100
-            )
-        with col2:
-            set_base = st.selectbox(
-                "Buscar dentro de:",
-                ["Todo el corpus"] + list(st.session_state.sets.keys())
-            )
-            max_sin = st.slider("Máx. sinónimos", 0, 6, 3)
-
-        with st.expander("✏️ Escribir términos manualmente (úsalo si los resultados son 0)"):
-            st.caption("Un término por línea, 2-4 palabras. Si escribes aquí, se ignoran los términos de Claude.")
-            terminos_manuales = st.text_area(
-                "Términos:",
-                placeholder="término exacto a buscar\notra variante del término",
-                height=120,
-                key="terminos_manuales"
-            )
-
-        if st.button("🔍 Buscar", type="primary", use_container_width=True):
-            if not consulta.strip():
-                st.error("Escribe una consulta.")
-            elif not api_key:
-                st.error("Ingresa tu API Key en el panel izquierdo.")
-            else:
-                manuales_txt = st.session_state.get("terminos_manuales", "").strip()
-                if manuales_txt:
-                    principales = [l.strip() for l in manuales_txt.splitlines() if l.strip()]
-                    sinonimos   = []
-                    st.info(f"Usando {len(principales)} términos manuales.")
-                else:
-                    desc = st.session_state.get("descripcion_corpus", "").strip()
-                    with st.spinner("Claude interpretando la consulta..."):
-                        datos = extraer_terminos_claude(consulta, desc, max_sin)
-                    if "raw" in datos and not datos.get("terminos_principales"):
-                        st.error("Claude no pudo interpretar. Respuesta:")
-                        st.code(datos.get("raw", ""))
-                        st.stop()
-                    principales = datos.get("terminos_principales", [])
-                    sinonimos   = datos.get("sinonimos", [])
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.write("🎯 Principales:", principales)
-                with col_b:
-                    st.write("🔄 Sinónimos:", sinonimos)
-
-                if set_base == "Todo el corpus":
-                    subcorpus = st.session_state.corpus
-                else:
-                    nombres_set = st.session_state.sets[set_base]
-                    subcorpus = {n: st.session_state.corpus[n]
-                                 for n in nombres_set if n in st.session_state.corpus}
-
-                with st.spinner(f"Buscando en {len(subcorpus)} documentos..."):
-                    resultados, estrategia = buscar_con_fallback(principales, sinonimos, subcorpus)
-
-                total_base = len(subcorpus)
-                pct = (len(resultados) / total_base * 100) if total_base > 0 else 0
-                st.markdown(f"### Resultados: **{len(resultados)}** documentos ({pct:.1f}% de {total_base})")
-                st.caption(f"Estrategia: {estrategia}")
-
-                if resultados:
-                    nombre_set     = guardar_set(resultados)
-                    todos_terminos = principales + sinonimos
-                    st.success(f"✅ Guardado como **{nombre_set}**")
-                    st.session_state.historial.append({
-                        "set"        : nombre_set,
-                        "consulta"   : consulta,
-                        "base"       : set_base,
-                        "terminos"   : todos_terminos,
-                        "resultados" : len(resultados),
-                        "estrategia" : estrategia
-                    })
-                    # Persistir resultados para el visor (sobrevive a reruns del botón "Marcar")
-                    st.session_state.ultimo_resultado = {
-                        "resultados"    : resultados,
-                        "todos_terminos": todos_terminos,
-                        "nombre_set"    : nombre_set,
-                        "set_base"      : set_base,
-                    }
-                else:
-                    st.session_state.ultimo_resultado = None
-                    st.warning(
-                        "0 resultados. Abre 'Escribir términos manualmente' "
-                        "e intenta con palabras más simples y cortas."
-                    )
-
-        # ── Visor de resultados (persiste entre reruns) ─────────────────────
-        if st.session_state.ultimo_resultado:
-            ur             = st.session_state.ultimo_resultado
-            res_nombres    = ur["resultados"]
-            res_terminos   = ur["todos_terminos"]
-            res_set_name   = ur["nombre_set"]
-            res_set_base   = ur["set_base"]
-
-            # Reconstruir subcorpus desde session_state (sin duplicar textos)
-            if res_set_base == "Todo el corpus":
-                sub = st.session_state.corpus
-            else:
-                nms = st.session_state.sets.get(res_set_base, [])
-                sub = {n: st.session_state.corpus[n]
-                       for n in nms if n in st.session_state.corpus}
-
-            # Dataframe de extractos
-            filas_display = []
-            for nombre in res_nombres[:50]:
-                texto    = sub.get(nombre, "")
-                extracto = obtener_extracto(texto, res_terminos, 250)
-                filas_display.append({"Documento": nombre, "Extracto": extracto})
-            st.dataframe(pd.DataFrame(filas_display), use_container_width=True, height=400)
-            if len(res_nombres) > 50:
-                st.caption(
-                    f"_(Mostrando 50 de {len(res_nombres)}. "
-                    f"Exporta CSV para ver todos.)_"
-                )
-
-            # ── Selector + visor de texto completo ───────────────────────────
-            st.markdown("---")
-            st.markdown("#### 📖 Leer documento completo")
-            opciones_visor = ["— Elige un documento —"] + res_nombres
-            doc_sel = st.selectbox(
-                "Selecciona un documento para ver su texto completo:",
-                opciones_visor,
-                key="visor_doc_sel"
-            )
-
-            if doc_sel != "— Elige un documento —":
-                texto_doc  = sub.get(doc_sel, "")
-                texto_html = resaltar_terminos(texto_doc, res_terminos)
-                st.markdown(
-                    f'<div style="height:540px;overflow-y:scroll;border:1px solid #D0D0D0;'
-                    f'padding:18px 20px;font-family:monospace;font-size:0.84rem;'
-                    f'white-space:pre-wrap;background:#FAFAFA;border-radius:8px;'
-                    f'line-height:1.65;">{texto_html}</div>',
-                    unsafe_allow_html=True
-                )
-                st.markdown("")
-
-                # ── Botón "Marcar como revisado" ─────────────────────────────
-                if doc_sel in st.session_state.revisados:
-                    st.success(f"✅ **{doc_sel}** ya está marcado como revisado.")
-                else:
-                    if st.button(
-                        "✅ Marcar como revisado",
-                        key="btn_marcar_revisado",
-                        type="primary"
-                    ):
-                        st.session_state.revisados.add(doc_sel)
-                        st.rerun()
-
-            # ── Exportar CSV (incluye columna "Revisado manualmente") ────────
-            st.markdown("")
-            csv_bytes = exportar_csv(res_nombres, sub, res_terminos)
-            st.download_button(
-                "⬇️ Exportar documentos (CSV)",
-                data=csv_bytes,
-                file_name=f"{res_set_name}_documentos.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-
-# ── TAB 2: ESTADÍSTICAS — sin cambios ───────────────────────────────────────
+# ── TAB 2: ESTADÍSTICAS ─────────────────────────────────────────────────────
 with tab2:
     st.subheader("📊 Estadísticas")
     if not st.session_state.corpus:
@@ -916,13 +797,13 @@ with tab4:
             st.session_state.historial = []
             st.rerun()
 
-# ── TAB 5: DETECCIÓN IA ──────────────────────────────────────────────────────
+# ── TAB 5: ÍNDICE IA ─────────────────────────────────────────────────────────
 with tab5:
-    st.subheader("🤖 Detección asistida por IA")
+    st.subheader("📑 Índice semántico IA")
     st.caption(
-        "Detecta automáticamente sentencias donde el juez **omite transcribir** "
-        "los conceptos de violación o agravios. Claude analiza cada documento "
-        "fragmento por fragmento y se detiene en cuanto encuentra el patrón."
+        "Indexa el corpus una sola vez (Haiku, ~$2-4). "
+        "Luego consulta cualquier patrón en lenguaje natural en segundos, "
+        "sin gastar tokens adicionales."
     )
 
     if not st.session_state.corpus:
@@ -930,151 +811,213 @@ with tab5:
     elif not api_key:
         st.warning("⬅️ Ingresa tu API Key en el panel izquierdo.")
     else:
-        col_ia1, col_ia2 = st.columns([2, 1])
-        with col_ia1:
-            palabras_prefilter = st.text_area(
-                "Palabras clave para pre-filtrar (opcional):",
-                placeholder=(
-                    "innecesario transcribir\n"
-                    "conceptos de violación\n"
-                    "agravios\n"
-                    "omite transcripción"
-                ),
-                height=120,
-                key="ia_palabras_clave",
-                help=(
-                    "Solo los documentos que contengan al menos una de estas palabras "
-                    "se enviarán a Claude. Reduce costos de API sin perder precisión."
+        # ── Sección 1: Indexar ────────────────────────────────────────────────
+        st.markdown("### 1 · Indexar corpus")
+        n_corp  = len(st.session_state.corpus)
+        n_idx   = len(st.session_state.indice)
+        pendientes = n_corp - n_idx
+
+        col_idx1, col_idx2, col_idx3 = st.columns(3)
+        col_idx1.metric("Documentos en corpus",   n_corp)
+        col_idx2.metric("Documentos indexados",   n_idx)
+        col_idx3.metric("Pendientes",             pendientes)
+
+        col_b1, col_b2, col_b3 = st.columns(3)
+        with col_b1:
+            btn_indexar = st.button(
+                "⚡ Indexar corpus" if pendientes == n_corp else "⚡ Indexar pendientes",
+                type="primary", use_container_width=True, key="btn_indexar"
+            )
+        with col_b2:
+            # Cargar índice guardado
+            idx_file = st.file_uploader(
+                "Cargar índice (JSON)", type=["json"], key="carga_indice",
+                help="Sube un índice guardado previamente para no re-indexar."
+            )
+            if idx_file:
+                try:
+                    cargado = json.loads(idx_file.read().decode("utf-8"))
+                    st.session_state.indice = cargado
+                    st.success(f"✅ Índice cargado: {len(cargado)} documentos.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al cargar: {e}")
+        with col_b3:
+            if st.session_state.indice:
+                json_bytes = json.dumps(
+                    st.session_state.indice, ensure_ascii=False, indent=2
+                ).encode("utf-8")
+                st.download_button(
+                    "💾 Guardar índice (JSON)",
+                    data=json_bytes,
+                    file_name="indice_corpus.json",
+                    mime="application/json",
+                    use_container_width=True
                 )
-            )
-        with col_ia2:
-            st.markdown("**ℹ️ Cómo funciona**")
-            st.markdown(
-                "1. Pre-filtra por palabras clave (gratis)\n"
-                "2. Divide cada doc en fragmentos de ~1 200 chars\n"
-                "3. Envía fragmento por fragmento a Claude\n"
-                "4. Para en cuanto detecta el patrón\n"
-                "5. Cachea resultados para no reprocesar"
-            )
 
-        col_run1, col_run2 = st.columns(2)
-        with col_run1:
-            btn_analizar = st.button(
-                "🔍 Analizar corpus", type="primary", use_container_width=True,
-                key="btn_ia_analizar"
-            )
-        with col_run2:
-            btn_limpiar_cache = st.button(
-                "🗑️ Limpiar caché IA", use_container_width=True,
-                key="btn_ia_limpiar_cache"
-            )
-
-        if btn_limpiar_cache:
-            st.session_state.ia_cache = {}
-            st.session_state.ia_resultados = []
-            st.session_state.ia_revisados = set()
-            st.success("Caché limpiada.")
-            st.rerun()
-
-        if btn_analizar:
-            kw_lista = [
-                kw.strip() for kw in palabras_prefilter.splitlines() if kw.strip()
-            ]
-            docs_candidatos = filtrar_documentos(st.session_state.corpus, kw_lista)
-
-            if not docs_candidatos:
-                st.warning("El pre-filtro no encontró documentos candidatos. "
-                           "Deja el campo en blanco para analizar todo el corpus.")
+        if btn_indexar:
+            # Solo indexar los documentos que aún no están en el índice
+            pendientes_dict = {
+                n: t for n, t in st.session_state.corpus.items()
+                if n not in st.session_state.indice
+            }
+            if not pendientes_dict:
+                st.info("Todos los documentos ya están indexados.")
             else:
-                st.info(
-                    f"Pre-filtro: **{len(docs_candidatos)}** documentos candidatos "
-                    f"de {len(st.session_state.corpus)} totales."
-                )
-                progreso = st.progress(0, text="Iniciando análisis...")
-                resultados_ia = []
-                total = len(docs_candidatos)
+                barra   = st.progress(0, text="Iniciando indexación...")
+                counter = {"n": 0}
 
-                for i, nombre in enumerate(docs_candidatos):
-                    progreso.progress(
-                        (i + 1) / total,
-                        text=f"Analizando {i+1}/{total}: {nombre[:50]}"
+                def _cb(completados, total, nombre):
+                    counter["n"] = completados
+                    barra.progress(
+                        completados / total,
+                        text=f"Indexando {completados}/{total}: {nombre[:55]}"
                     )
-                    texto = st.session_state.corpus[nombre]
-                    res = procesar_documento(
-                        nombre, texto, api_key, st.session_state.ia_cache
-                    )
-                    if res["match"]:
-                        resultados_ia.append({
-                            "documento": nombre,
-                            "fragmento": res["fragmento"],
-                            "revisado" : nombre in st.session_state.ia_revisados
-                        })
 
-                progreso.empty()
-                st.session_state.ia_resultados = resultados_ia
+                nuevos = indexar_corpus_paralelo(pendientes_dict, api_key, _cb)
+                st.session_state.indice.update(nuevos)
+                barra.empty()
+                errores = sum(1 for v in nuevos.values() if "_error" in v)
                 st.success(
-                    f"✅ Análisis completo. "
-                    f"**{len(resultados_ia)}** documento(s) con el patrón detectado."
+                    f"✅ Indexación completa. "
+                    f"{len(nuevos) - errores} documentos procesados"
+                    + (f", {errores} con error." if errores else ".")
                 )
 
-        # ── Visor de resultados IA ─────────────────────────────────────────────
-        if st.session_state.ia_resultados:
+        # ── Estadísticas del índice ───────────────────────────────────────────
+        if st.session_state.indice:
             st.markdown("---")
-            st.markdown(
-                f"### {len(st.session_state.ia_resultados)} documento(s) detectados"
+            st.markdown("### 2 · Frecuencias de patrones detectados")
+            st.caption(
+                "Porcentaje de sentencias donde Haiku detectó cada patrón. "
+                "Base: documentos indexados sin error."
+            )
+            validos = [v for v in st.session_state.indice.values() if "_error" not in v]
+            n_val   = len(validos)
+            if n_val:
+                filas_freq = []
+                for campo, etiqueta in CAMPOS_BOOLEANOS:
+                    cuenta = sum(1 for v in validos if v.get(campo) is True)
+                    filas_freq.append({
+                        "Patrón"          : etiqueta,
+                        "Documentos"      : cuenta,
+                        "% del corpus"    : f"{cuenta/n_val*100:.1f}%",
+                    })
+                st.dataframe(
+                    pd.DataFrame(filas_freq).sort_values("Documentos", ascending=False),
+                    use_container_width=True, hide_index=True
+                )
+
+                # Distribución de resoluciones
+                resoluciones = {}
+                for v in validos:
+                    r = v.get("resolucion", "otro")
+                    resoluciones[r] = resoluciones.get(r, 0) + 1
+                cols_res = st.columns(len(resoluciones))
+                for i, (res, cnt) in enumerate(
+                    sorted(resoluciones.items(), key=lambda x: -x[1])
+                ):
+                    cols_res[i].metric(res.capitalize(), cnt)
+
+            # ── Sección 3: Consultar ──────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 3 · Consultar índice en lenguaje natural")
+            st.caption(
+                "Describe el patrón que buscas. Claude compara tu descripción "
+                "con las fichas del índice. Sin keywords, sin límites de patrón."
             )
 
-            for idx, item in enumerate(st.session_state.ia_resultados):
-                nombre_doc = item["documento"]
-                fragmento  = item["fragmento"]
-                revisado   = nombre_doc in st.session_state.ia_revisados
+            consulta_ia = st.text_area(
+                "¿Qué buscas?",
+                placeholder=(
+                    "Ej: sentencias donde el juez otorga valor pleno al perito sin cuestionarlo\n"
+                    "Ej: casos de sobreseimiento basados solo en el informe de la autoridad\n"
+                    "Ej: resoluciones que validan documentos de internet sin verificar"
+                ),
+                height=100,
+                key="consulta_ia"
+            )
 
-                with st.expander(
-                    f"{'✅' if revisado else '🔴'} {nombre_doc}",
-                    expanded=not revisado
-                ):
-                    if fragmento:
-                        st.markdown("**Fragmento detectado:**")
-                        st.markdown(
-                            f'<div style="background:#1E2D40;border-left:4px solid #C8622A;'
-                            f'padding:12px 16px;border-radius:6px;font-family:monospace;'
-                            f'font-size:0.85rem;color:#F0EBE3;white-space:pre-wrap;">'
-                            f'{html.escape(fragmento)}</div>',
-                            unsafe_allow_html=True
+            col_q1, col_q2 = st.columns(2)
+            with col_q1:
+                btn_consultar = st.button(
+                    "🔍 Consultar", type="primary",
+                    use_container_width=True, key="btn_consultar_ia"
+                )
+            with col_q2:
+                if st.button("🗑️ Limpiar resultados", use_container_width=True, key="btn_limpiar_ia"):
+                    st.session_state.ia_resultados_consulta = []
+                    st.rerun()
+
+            if btn_consultar:
+                if not consulta_ia.strip():
+                    st.error("Escribe una consulta.")
+                else:
+                    with st.spinner("Consultando índice..."):
+                        matches = consultar_indice(
+                            st.session_state.indice, consulta_ia, api_key
                         )
-                    else:
-                        st.caption("_(Claude detectó el patrón pero no extrajo fragmento)_")
+                    st.session_state.ia_resultados_consulta = matches
+                    st.success(
+                        f"✅ {len(matches)} documento(s) coinciden con la búsqueda."
+                    )
 
+            # ── Resultados de consulta ────────────────────────────────────────
+            if st.session_state.ia_resultados_consulta:
+                matches = st.session_state.ia_resultados_consulta
+                st.markdown(f"#### {len(matches)} resultados")
+
+                filas_res = []
+                for m in matches:
+                    doc    = m.get("doc", "")
+                    razon  = m.get("razon", "")
+                    ficha  = st.session_state.indice.get(doc, {})
+                    filas_res.append({
+                        "Documento" : doc,
+                        "Razón IA"  : razon,
+                        "Resolución": ficha.get("resolucion", ""),
+                        "Resumen"   : ficha.get("resumen", ""),
+                        "Revisado"  : "Sí" if doc in st.session_state.ia_revisados else "No",
+                    })
+                st.dataframe(
+                    pd.DataFrame(filas_res),
+                    use_container_width=True, height=380
+                )
+
+                # Visor de texto original + botón marcar
+                st.markdown("---")
+                st.markdown("#### 📖 Ver texto original")
+                opciones = ["— Elige un documento —"] + [m.get("doc","") for m in matches]
+                doc_sel  = st.selectbox("Documento:", opciones, key="ia_visor_sel")
+
+                if doc_sel != "— Elige un documento —":
+                    texto_orig = st.session_state.corpus.get(doc_sel, "")
+                    st.markdown(
+                        f'<div style="height:480px;overflow-y:scroll;border:1px solid #2A3D52;'
+                        f'padding:16px 20px;font-family:monospace;font-size:0.83rem;'
+                        f'white-space:pre-wrap;background:#172030;color:#F0EBE3;'
+                        f'border-radius:8px;line-height:1.65;">'
+                        f'{html.escape(texto_orig)}</div>',
+                        unsafe_allow_html=True
+                    )
                     st.markdown("")
-                    if revisado:
-                        st.success("✅ Marcado como revisado")
+                    if doc_sel in st.session_state.ia_revisados:
+                        st.success("✅ Ya marcado como revisado.")
                     else:
-                        if st.button(
-                            "✅ Marcar como revisado",
-                            key=f"ia_marcar_{idx}",
-                            type="primary"
-                        ):
-                            st.session_state.ia_revisados.add(nombre_doc)
+                        if st.button("✅ Marcar como revisado", type="primary",
+                                     key="ia_marcar_visor"):
+                            st.session_state.ia_revisados.add(doc_sel)
                             st.rerun()
 
-            # ── Exportar CSV de detección IA ──────────────────────────────────
-            st.markdown("---")
-            filas_ia = []
-            for item in st.session_state.ia_resultados:
-                filas_ia.append({
-                    "documento"                 : item["documento"],
-                    "fragmento_detectado"       : item["fragmento"],
-                    "match_ia"                  : True,
-                    "revisado_manualmente"      : "Sí" if item["documento"] in st.session_state.ia_revisados else "No",
-                    "validacion_investigador"   : "",
-                    "observaciones"             : "",
-                })
-            df_ia = pd.DataFrame(filas_ia)
-            csv_ia = df_ia.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button(
-                "⬇️ Exportar resultados IA (CSV)",
-                data=csv_ia,
-                file_name="deteccion_ia_omision_conceptos.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+                # Exportar CSV
+                st.markdown("")
+                csv_ia = pd.DataFrame(filas_res).to_csv(
+                    index=False, encoding="utf-8-sig"
+                ).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ Exportar resultados (CSV)",
+                    data=csv_ia,
+                    file_name="consulta_ia.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
