@@ -11,9 +11,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CARPETA_TXT  = os.environ.get("CARPETA_TXT", r"C:\Users\kians\Desktop\sentencias individuales txt")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-CLAUDE_HAIKU = "claude-haiku-4-5-20251001"   # para detección IA: 20× más rápido y barato
+CLAUDE_HAIKU = "claude-haiku-3-5-20241022"   # para detección IA: rápido y barato
 CLAUDE_URL   = "https://api.anthropic.com/v1/messages"
-IA_WORKERS   = 8                              # llamadas paralelas a la API
+IA_WORKERS   = 3                              # llamadas paralelas (conservador para evitar rate limit)
 
 st.set_page_config(page_title="Análisis de Corpus Jurídico", layout="wide")
 
@@ -883,6 +883,14 @@ with tab5:
                     f"{len(nuevos) - errores} documentos procesados"
                     + (f", {errores} con error." if errores else ".")
                 )
+                if errores:
+                    muestra_errores = [
+                        f"{v['_documento']}: {v['_error']}"
+                        for v in nuevos.values() if "_error" in v
+                    ][:5]
+                    with st.expander(f"Ver primeros errores ({min(5, errores)} de {errores})"):
+                        for e in muestra_errores:
+                            st.code(e)
 
         # ── Estadísticas del índice ───────────────────────────────────────────
         if st.session_state.indice:
