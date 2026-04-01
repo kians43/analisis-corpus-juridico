@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CARPETA_TXT  = os.environ.get("CARPETA_TXT", r"C:\Users\kians\Desktop\sentencias individuales txt")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-CLAUDE_HAIKU = "claude-haiku-3-5-20241022"   # para detección IA: rápido y barato
+CLAUDE_HAIKU = "claude-3-5-haiku-20241022"   # para detección IA: rápido y barato
 CLAUDE_URL   = "https://api.anthropic.com/v1/messages"
 IA_WORKERS   = 3                              # llamadas paralelas (conservador para evitar rate limit)
 
