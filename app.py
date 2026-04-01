@@ -348,6 +348,8 @@ if "ia_resultados_consulta" not in st.session_state:
     st.session_state.ia_resultados_consulta = []
 if "esquema_guardado" not in st.session_state:
     st.session_state.esquema_guardado = {}
+if "confirmados" not in st.session_state:
+    st.session_state.confirmados = {}   # {patron_key: set(nombres_doc)}
 
 with st.sidebar:
     # ── Paso 1 ───────────────────────────────────────────────────────────────
@@ -964,9 +966,128 @@ with tab1:
                 for i, (res, cnt) in enumerate(top_res):
                     cols_res[i].metric(res.capitalize(), cnt)
 
-            # ── Sección 3: Consultar ──────────────────────────────────────────
+            # ── Sección 3: Validar hallazgos ─────────────────────────────────
             st.markdown("---")
-            st.markdown("### 3 · Consultar índice en lenguaje natural")
+            st.markdown("### 3 · Validar hallazgos por patrón")
+            st.caption(
+                "Selecciona un patrón, revisa cada documento detectado y "
+                "palomea los que confirmas. El total validado es tu cifra definitiva."
+            )
+
+            if esquema_viz and validos:
+                opciones_patron = {
+                    desc: clave for clave, desc in esquema_viz.items()
+                }
+                patron_sel_desc = st.selectbox(
+                    "Patrón a validar:",
+                    list(opciones_patron.keys()),
+                    key="sel_patron_validar"
+                )
+                patron_sel_clave = opciones_patron[patron_sel_desc]
+
+                # Documentos donde la IA detectó este patrón
+                docs_detectados = [
+                    v for v in validos if v.get(patron_sel_clave) is True
+                ]
+
+                # Inicializar set de confirmados para este patrón
+                if patron_sel_clave not in st.session_state.confirmados:
+                    st.session_state.confirmados[patron_sel_clave] = set()
+                confirmados_set = st.session_state.confirmados[patron_sel_clave]
+
+                # Métricas resumen
+                n_det  = len(docs_detectados)
+                n_conf = len(confirmados_set)
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Detectados por IA", n_det)
+                mc2.metric("Confirmados por investigador", n_conf)
+                mc3.metric("Tasa de precisión", f"{n_conf/n_det*100:.0f}%" if n_det else "—")
+
+                if not docs_detectados:
+                    st.info("La IA no detectó este patrón en ningún documento.")
+                else:
+                    st.markdown(f"**{n_det} documento(s) detectados** — palomea los que confirmas:")
+                    st.markdown("")
+
+                    for doc_ficha in docs_detectados:
+                        nombre_doc = doc_ficha.get("_documento", "")
+                        resumen    = doc_ficha.get("resumen", "")
+                        resolucion = doc_ficha.get("resolucion", "")
+                        confirmado = nombre_doc in confirmados_set
+
+                        col_chk, col_info = st.columns([1, 8])
+                        with col_chk:
+                            checked = st.checkbox(
+                                "✓", value=confirmado,
+                                key=f"chk_{patron_sel_clave}_{nombre_doc}"
+                            )
+                            if checked and nombre_doc not in confirmados_set:
+                                st.session_state.confirmados[patron_sel_clave].add(nombre_doc)
+                                st.rerun()
+                            elif not checked and nombre_doc in confirmados_set:
+                                st.session_state.confirmados[patron_sel_clave].discard(nombre_doc)
+                                st.rerun()
+                        with col_info:
+                            st.markdown(
+                                f'<div style="background:{"#1a3a1a" if confirmado else "#1E2D40"};'
+                                f'border-left:4px solid {"#4CAF50" if confirmado else "#C8622A"};'
+                                f'padding:10px 14px;border-radius:6px;margin-bottom:6px;">'
+                                f'<span style="color:#A89A8E;font-size:0.78rem;">{nombre_doc}</span><br>'
+                                f'<span style="color:#F0EBE3;font-size:0.88rem;">{html.escape(resumen)}</span><br>'
+                                f'<span style="color:#C8622A;font-size:0.78rem;">→ {html.escape(resolucion)}</span>'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+
+                    # Exportar validación
+                    st.markdown("")
+                    filas_val = []
+                    for doc_ficha in docs_detectados:
+                        nd = doc_ficha.get("_documento", "")
+                        filas_val.append({
+                            "documento"          : nd,
+                            "resumen"            : doc_ficha.get("resumen", ""),
+                            "resolucion"         : doc_ficha.get("resolucion", ""),
+                            "detectado_ia"       : "Sí",
+                            "confirmado_investigador": "Sí" if nd in confirmados_set else "No",
+                        })
+                    csv_val = pd.DataFrame(filas_val).to_csv(
+                        index=False, encoding="utf-8-sig"
+                    ).encode("utf-8-sig")
+                    st.download_button(
+                        f"⬇️ Exportar validación — {patron_sel_desc[:40]} (CSV)",
+                        data=csv_val,
+                        file_name=f"validacion_{patron_sel_clave}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+            # ── Sección 4: Ver texto original ────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 4 · Leer documento completo")
+            st.caption("Selecciona cualquier documento indexado para leer su texto completo y corroborar los hallazgos.")
+
+            todos_indexados = sorted(st.session_state.indice.keys())
+            doc_leer = st.selectbox(
+                "Documento:", ["— elige —"] + todos_indexados, key="sel_doc_leer"
+            )
+            if doc_leer != "— elige —":
+                texto_orig = st.session_state.corpus.get(doc_leer, "")
+                if texto_orig:
+                    st.markdown(
+                        f'<div style="height:520px;overflow-y:scroll;border:1px solid #2A3D52;'
+                        f'padding:16px 20px;font-family:monospace;font-size:0.83rem;'
+                        f'white-space:pre-wrap;background:#172030;color:#F0EBE3;'
+                        f'border-radius:8px;line-height:1.65;">'
+                        f'{html.escape(texto_orig)}</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.warning("El documento no está en memoria. Súbelo en el panel izquierdo.")
+
+            # ── Sección 5: Consultar ──────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 5 · Consultar índice en lenguaje natural")
             st.caption(
                 "Describe el patrón que buscas. Claude compara tu descripción "
                 "con las fichas del índice. Sin keywords, sin límites de patrón."
