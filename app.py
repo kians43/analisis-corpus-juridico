@@ -7,13 +7,14 @@ import hashlib
 import requests
 import pandas as pd
 from pathlib import Path
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CARPETA_TXT  = os.environ.get("CARPETA_TXT", r"C:\Users\kians\Desktop\sentencias individuales txt")
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_HAIKU = CLAUDE_MODEL   # usa el mismo modelo verificado del resto de la app
 CLAUDE_URL   = "https://api.anthropic.com/v1/messages"
-IA_WORKERS   = 3                              # llamadas paralelas (conservador para evitar rate limit)
+IA_WORKERS   = 1             # secuencial para respetar rate limits de la API
 
 st.set_page_config(page_title="Análisis de Corpus Jurídico", layout="wide")
 
@@ -603,13 +604,23 @@ def indexar_documento(nombre, texto, ak, esquema, tipo_corpus="documentos"):
                "x-api-key": ak, "anthropic-version": "2023-06-01"}
     body    = {"model": CLAUDE_HAIKU, "max_tokens": 600,
                "messages": [{"role": "user", "content": prompt}]}
-    try:
-        r     = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=30)
-        r.raise_for_status()
-        raw   = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
-        datos = json.loads(raw)
-    except Exception as e:
-        datos = {"_error": str(e)}
+    datos = {}
+    for intento in range(4):          # hasta 3 reintentos
+        try:
+            r = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=45)
+            if r.status_code == 429:  # rate limit: espera y reintenta
+                espera = 30 * (intento + 1)
+                time.sleep(espera)
+                continue
+            r.raise_for_status()
+            raw   = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
+            datos = json.loads(raw)
+            break
+        except Exception as e:
+            if intento == 3:
+                datos = {"_error": str(e)}
+            else:
+                time.sleep(10)
     datos["_hash"]      = h
     datos["_documento"] = nombre
     return datos
