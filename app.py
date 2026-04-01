@@ -345,41 +345,52 @@ if "ia_revisados" not in st.session_state:
     st.session_state.ia_revisados = set()
 if "ia_resultados_consulta" not in st.session_state:
     st.session_state.ia_resultados_consulta = []
+if "esquema_guardado" not in st.session_state:
+    st.session_state.esquema_guardado = {}
 
 with st.sidebar:
-    st.header("⚙️ Configuración")
+    # ── Paso 1 ───────────────────────────────────────────────────────────────
+    st.markdown("### Paso 1 · API Key")
     api_key = st.text_input("API Key de Claude", type="password", key="api_key")
+    if api_key:
+        st.caption("✅ API Key ingresada")
 
     st.markdown("---")
 
-    # NUEVO: descripción del corpus que calibra a Claude
-    st.header("📋 Tipo de corpus")
-    descripcion_corpus = st.text_area(
-        "Describe brevemente tus documentos:",
-        placeholder=(
-            "Ej: sentencias de amparo indirecto en materia administrativa "
-            "emitidas por juzgados federales en México\n\n"
-            "Ej: contratos de arrendamiento comercial\n\n"
-            "Ej: laudos arbitrales en materia mercantil"
-        ),
-        height=110,
-        key="descripcion_corpus",
-        help=(
-            "Esta descripción le indica a Claude qué tipo de documentos "
-            "está analizando, para que genere términos de búsqueda "
-            "calibrados al lenguaje específico de tu corpus."
-        )
+    # ── Paso 2 ───────────────────────────────────────────────────────────────
+    st.markdown("### Paso 2 · Define tus patrones")
+    st.caption(
+        "Escribe en lenguaje natural los fenómenos que quieres detectar. "
+        "Un patrón por línea. Claude los buscará en cada documento."
     )
-    if not descripcion_corpus.strip():
-        st.caption("⚠️ Describe tu corpus para obtener mejores términos de búsqueda.")
+    patrones_txt = st.text_area(
+        "Patrones a detectar:",
+        placeholder=(
+            "Ej: El juez omite transcribir los conceptos de violación\n"
+            "Ej: La sentencia sobresee el amparo\n"
+            "Ej: El juez menciona falta de tóner o papel\n"
+            "Ej: Se rechaza un documento digital o con QR\n"
+            "Ej: El juez otorga valor al perito sin análisis crítico"
+        ),
+        height=180,
+        key="patrones_txt",
+        help="Estos patrones se convierten en preguntas sí/no para cada documento del corpus."
+    )
+    patrones_lista = [l.strip() for l in patrones_txt.splitlines() if l.strip()]
+    if patrones_lista:
+        st.caption(f"✅ {len(patrones_lista)} patrón(es) definido(s)")
+    else:
+        st.caption("⚠️ Define al menos un patrón antes de indexar.")
 
     st.markdown("---")
-    st.header("📂 Corpus")
+
+    # ── Paso 3 ───────────────────────────────────────────────────────────────
+    st.markdown("### Paso 3 · Carga tu corpus")
     archivos_subidos = st.file_uploader(
-        "Sube tus archivos TXT",
+        "Archivos TXT",
         type=["txt"],
         accept_multiple_files=True,
-        help="Selecciona uno o varios archivos .txt para cargar tu corpus."
+        help="Selecciona uno o varios archivos .txt."
     )
     if archivos_subidos:
         corpus_temp = {}
@@ -393,11 +404,13 @@ with st.sidebar:
             st.session_state.corpus = corpus_temp
             st.success(f"✅ {len(corpus_temp)} documentos cargados")
     if st.session_state.corpus:
-        st.info(f"📄 {len(st.session_state.corpus)} documentos en memoria")
+        st.info(f"📄 {len(st.session_state.corpus)} docs en memoria")
         if st.button("🗑️ Limpiar corpus", use_container_width=True):
             st.session_state.corpus = {}
             st.rerun()
+
     st.markdown("---")
+    st.markdown("### Herramientas avanzadas")
     st.header("🗂️ Sets guardados")
     if st.session_state.sets:
         for nombre_set, lista in st.session_state.sets.items():
@@ -533,60 +546,47 @@ def identificar_referencias(texto, patrones_custom):
 # Esquema de extracción: cubre los 7 patrones identificados en la investigación.
 # Haiku llena este JSON por cada sentencia (una sola llamada por documento).
 
-CAMPOS_BOOLEANOS = [
-    ("omite_transcripcion_conceptos",        "Omite transcripción de conceptos/agravios"),
-    ("silencio_administrativo",              "Acto reclamado: silencio/omisión de autoridad"),
-    ("clausula_precariedad",                 "Cláusula de precariedad (tóner/papel)"),
-    ("rechazo_documento_digital",            "Rechazo de documento digital/QR"),
-    ("sesgo_negativa_autoridad",             "Sesgo: negativa de autoridad como verdad base"),
-    ("sobreseimiento",                       "Sentencia: sobreseimiento"),
-    ("delegacion_pericial_acritica",         "Delegación acrítica en perito"),
-    ("hecho_notorio_digital_sin_protocolo",  "Hecho notorio digital sin protocolo"),
-]
-
-_ESQUEMA_PROMPT = """{
-  "omite_transcripcion_conceptos": bool,
-  "justificacion_omision": "cita breve o ''",
-  "silencio_administrativo": bool,
-  "tipo_acto_reclamado": "descripción breve",
-  "clausula_precariedad": bool,
-  "texto_precariedad": "cita o ''",
-  "rechazo_documento_digital": bool,
-  "razon_rechazo_digital": "razón o ''",
-  "sesgo_negativa_autoridad": bool,
-  "sobreseimiento": bool,
-  "delegacion_pericial_acritica": bool,
-  "hecho_notorio_digital_sin_protocolo": bool,
-  "resolucion": "concede | niega | sobresee | otro",
-  "resumen": "máximo 2 oraciones del caso"
-}"""
 
 
-def indexar_documento(nombre, texto, ak):
+def construir_esquema(patrones):
+    """Convierte lista de descripciones en dict {clave: descripcion}."""
+    return {f"patron_{i+1}": desc for i, desc in enumerate(patrones)}
+
+
+def indexar_documento(nombre, texto, ak, esquema):
     """
-    Extrae el JSON estructurado de una sentencia con Haiku.
-    Solo usa los primeros 6 000 caracteres (~1 500 tokens) para minimizar costo.
-    Retorna el dict JSON más _hash y _documento.
+    Extrae el JSON estructurado de un documento con Claude.
+    esquema = {"patron_1": "descripción…", "patron_2": "descripción…", …}
+    Usa los primeros 6 000 caracteres para minimizar costo.
     """
-    h       = hashlib.md5(texto.encode("utf-8")).hexdigest()
+    h        = hashlib.md5(texto.encode("utf-8")).hexdigest()
     extracto = texto[:6000]
-    prompt  = (
-        "Eres un asistente de análisis jurídico mexicano.\n"
-        "Analiza esta sentencia de amparo y extrae información estructurada.\n"
-        "Responde ÚNICAMENTE con un objeto JSON que tenga exactamente estas claves:\n\n"
-        f"{_ESQUEMA_PROMPT}\n\n"
-        "Reglas: bool → true/false en minúsculas; texto vacío → \"\"; "
-        "sin texto antes ni después del JSON.\n\n"
-        f"Sentencia (primeros 6 000 caracteres):\n\"\"\"\n{extracto}\n\"\"\""
+
+    campos_str = "\n".join(
+        f'  "{k}": bool,   // ¿{v}?'
+        for k, v in esquema.items()
+    )
+    prompt = (
+        "Eres un asistente de análisis de documentos. "
+        "Analiza el siguiente documento y responde ÚNICAMENTE con un objeto JSON.\n\n"
+        "El JSON debe tener exactamente estas claves:\n"
+        "{\n"
+        f"{campos_str}\n"
+        '  "resolucion": "resultado principal del documento en 5 palabras",\n'
+        '  "resumen": "máximo 2 oraciones del contenido"\n'
+        "}\n\n"
+        "Reglas estrictas: bool → true o false (minúsculas); "
+        "cadenas vacías → \"\"; sin texto antes ni después del JSON.\n\n"
+        f"Documento (primeros 6 000 caracteres):\n\"\"\"\n{extracto}\n\"\"\""
     )
     headers = {"Content-Type": "application/json",
                "x-api-key": ak, "anthropic-version": "2023-06-01"}
     body    = {"model": CLAUDE_HAIKU, "max_tokens": 600,
                "messages": [{"role": "user", "content": prompt}]}
     try:
-        r    = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=30)
+        r     = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=30)
         r.raise_for_status()
-        raw  = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
+        raw   = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
         datos = json.loads(raw)
     except Exception as e:
         datos = {"_error": str(e)}
@@ -595,13 +595,13 @@ def indexar_documento(nombre, texto, ak):
     return datos
 
 
-def indexar_corpus_paralelo(corpus, ak, cb_progreso=None):
+def indexar_corpus_paralelo(corpus, ak, esquema, cb_progreso=None):
     """Indexa todo el corpus en paralelo con ThreadPoolExecutor (IA_WORKERS hilos)."""
     resultado   = {}
     total       = len(corpus)
     completados = 0
     with ThreadPoolExecutor(max_workers=IA_WORKERS) as ex:
-        futures = {ex.submit(indexar_documento, n, t, ak): n
+        futures = {ex.submit(indexar_documento, n, t, ak, esquema): n
                    for n, t in corpus.items()}
         for f in as_completed(futures):
             nombre       = futures[f]
@@ -677,8 +677,8 @@ def exportar_csv(nombres, corpus, terminos):
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
-tab2, tab3, tab4, tab5 = st.tabs(
-    ["📊 Estadísticas", "🔗 Referencias", "📋 Historial", "📑 Índice IA"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["🔬 Análisis IA", "📊 Estadísticas", "🔗 Referencias", "📋 Historial"]
 )
 
 # ── TAB 2: ESTADÍSTICAS ─────────────────────────────────────────────────────
@@ -797,46 +797,58 @@ with tab4:
             st.session_state.historial = []
             st.rerun()
 
-# ── TAB 5: ÍNDICE IA ─────────────────────────────────────────────────────────
-with tab5:
-    st.subheader("📑 Índice semántico IA")
-    st.caption(
-        "Indexa el corpus una sola vez (Haiku, ~$2-4). "
-        "Luego consulta cualquier patrón en lenguaje natural en segundos, "
-        "sin gastar tokens adicionales."
-    )
+# ── TAB 1: ANÁLISIS IA ───────────────────────────────────────────────────────
+with tab1:
+    st.subheader("🔬 Análisis semántico de corpus")
 
-    if not st.session_state.corpus:
-        st.warning("⬅️ Primero carga los TXT desde el panel izquierdo.")
-    elif not api_key:
-        st.warning("⬅️ Ingresa tu API Key en el panel izquierdo.")
+    # ── Guía visual de pasos ─────────────────────────────────────────────────
+    if not api_key or not st.session_state.corpus or not patrones_lista:
+        st.markdown("#### Para comenzar completa los siguientes pasos en el panel izquierdo:")
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(
+            f"{'✅' if api_key else '⬜'} **Paso 1**\nIngresa tu API Key"
+        )
+        c2.markdown(
+            f"{'✅' if patrones_lista else '⬜'} **Paso 2**\nDefine tus patrones"
+        )
+        c3.markdown(
+            f"{'✅' if st.session_state.corpus else '⬜'} **Paso 3**\nCarga tu corpus"
+        )
     else:
         # ── Sección 1: Indexar ────────────────────────────────────────────────
         st.markdown("### 1 · Indexar corpus")
-        n_corp  = len(st.session_state.corpus)
-        n_idx   = len(st.session_state.indice)
+        st.caption(
+            f"Claude leerá cada documento y extraerá tus **{len(patrones_lista)} patrón(es)** "
+            "como campos estructurados. Solo se hace una vez — el resultado se puede guardar y reutilizar."
+        )
+
+        n_corp     = len(st.session_state.corpus)
+        n_idx      = len(st.session_state.indice)
         pendientes = n_corp - n_idx
 
         col_idx1, col_idx2, col_idx3 = st.columns(3)
-        col_idx1.metric("Documentos en corpus",   n_corp)
-        col_idx2.metric("Documentos indexados",   n_idx)
-        col_idx3.metric("Pendientes",             pendientes)
+        col_idx1.metric("Docs en corpus",   n_corp)
+        col_idx2.metric("Docs indexados",   n_idx)
+        col_idx3.metric("Pendientes",       pendientes)
 
         col_b1, col_b2, col_b3 = st.columns(3)
         with col_b1:
             btn_indexar = st.button(
                 "⚡ Indexar corpus" if pendientes == n_corp else "⚡ Indexar pendientes",
-                type="primary", use_container_width=True, key="btn_indexar"
+                type="primary", use_container_width=True, key="btn_indexar",
+                disabled=(pendientes == 0)
             )
         with col_b2:
-            # Cargar índice guardado
             idx_file = st.file_uploader(
-                "Cargar índice (JSON)", type=["json"], key="carga_indice",
-                help="Sube un índice guardado previamente para no re-indexar."
+                "Cargar índice guardado (JSON)", type=["json"], key="carga_indice",
+                help="Evita re-indexar subiendo un índice previo."
             )
             if idx_file:
                 try:
                     cargado = json.loads(idx_file.read().decode("utf-8"))
+                    # Recuperar esquema guardado si existe
+                    if "_esquema" in cargado:
+                        st.session_state.esquema_guardado = cargado.pop("_esquema")
                     st.session_state.indice = cargado
                     st.success(f"✅ Índice cargado: {len(cargado)} documentos.")
                     st.rerun()
@@ -844,9 +856,9 @@ with tab5:
                     st.error(f"Error al cargar: {e}")
         with col_b3:
             if st.session_state.indice:
-                json_bytes = json.dumps(
-                    st.session_state.indice, ensure_ascii=False, indent=2
-                ).encode("utf-8")
+                exportable = dict(st.session_state.indice)
+                exportable["_esquema"] = construir_esquema(patrones_lista)
+                json_bytes = json.dumps(exportable, ensure_ascii=False, indent=2).encode("utf-8")
                 st.download_button(
                     "💾 Guardar índice (JSON)",
                     data=json_bytes,
@@ -856,7 +868,7 @@ with tab5:
                 )
 
         if btn_indexar:
-            # Solo indexar los documentos que aún no están en el índice
+            esquema_actual = construir_esquema(patrones_lista)
             pendientes_dict = {
                 n: t for n, t in st.session_state.corpus.items()
                 if n not in st.session_state.indice
@@ -864,67 +876,60 @@ with tab5:
             if not pendientes_dict:
                 st.info("Todos los documentos ya están indexados.")
             else:
-                barra   = st.progress(0, text="Iniciando indexación...")
-                counter = {"n": 0}
+                barra = st.progress(0, text="Iniciando indexación...")
 
                 def _cb(completados, total, nombre):
-                    counter["n"] = completados
                     barra.progress(
                         completados / total,
                         text=f"Indexando {completados}/{total}: {nombre[:55]}"
                     )
 
-                nuevos = indexar_corpus_paralelo(pendientes_dict, api_key, _cb)
+                nuevos = indexar_corpus_paralelo(pendientes_dict, api_key, esquema_actual, _cb)
                 st.session_state.indice.update(nuevos)
+                st.session_state.esquema_guardado = esquema_actual
                 barra.empty()
                 errores = sum(1 for v in nuevos.values() if "_error" in v)
                 st.success(
-                    f"✅ Indexación completa. "
-                    f"{len(nuevos) - errores} documentos procesados"
+                    f"✅ Indexación completa. {len(nuevos) - errores} documentos procesados"
                     + (f", {errores} con error." if errores else ".")
                 )
                 if errores:
-                    muestra_errores = [
+                    muestra = [
                         f"{v['_documento']}: {v['_error']}"
                         for v in nuevos.values() if "_error" in v
                     ][:5]
-                    with st.expander(f"Ver primeros errores ({min(5, errores)} de {errores})"):
-                        for e in muestra_errores:
+                    with st.expander(f"Ver primeros errores ({min(5,errores)} de {errores})"):
+                        for e in muestra:
                             st.code(e)
 
-        # ── Estadísticas del índice ───────────────────────────────────────────
+        # ── Sección 2: Frecuencias ────────────────────────────────────────────
         if st.session_state.indice:
-            st.markdown("---")
-            st.markdown("### 2 · Frecuencias de patrones detectados")
-            st.caption(
-                "Porcentaje de sentencias donde Haiku detectó cada patrón. "
-                "Base: documentos indexados sin error."
-            )
+            esquema_viz = st.session_state.esquema_guardado or construir_esquema(patrones_lista)
             validos = [v for v in st.session_state.indice.values() if "_error" not in v]
             n_val   = len(validos)
-            if n_val:
+
+            if n_val and esquema_viz:
+                st.markdown("---")
+                st.markdown("### 2 · Frecuencias de patrones")
                 filas_freq = []
-                for campo, etiqueta in CAMPOS_BOOLEANOS:
-                    cuenta = sum(1 for v in validos if v.get(campo) is True)
+                for clave, descripcion in esquema_viz.items():
+                    cuenta = sum(1 for v in validos if v.get(clave) is True)
                     filas_freq.append({
-                        "Patrón"          : etiqueta,
-                        "Documentos"      : cuenta,
-                        "% del corpus"    : f"{cuenta/n_val*100:.1f}%",
+                        "Patrón"       : descripcion,
+                        "Documentos"   : cuenta,
+                        "% del corpus" : f"{cuenta/n_val*100:.1f}%",
                     })
                 st.dataframe(
                     pd.DataFrame(filas_freq).sort_values("Documentos", ascending=False),
                     use_container_width=True, hide_index=True
                 )
-
-                # Distribución de resoluciones
                 resoluciones = {}
                 for v in validos:
-                    r = v.get("resolucion", "otro")
+                    r = str(v.get("resolucion", "otro"))[:30]
                     resoluciones[r] = resoluciones.get(r, 0) + 1
-                cols_res = st.columns(len(resoluciones))
-                for i, (res, cnt) in enumerate(
-                    sorted(resoluciones.items(), key=lambda x: -x[1])
-                ):
+                top_res = sorted(resoluciones.items(), key=lambda x: -x[1])[:5]
+                cols_res = st.columns(len(top_res))
+                for i, (res, cnt) in enumerate(top_res):
                     cols_res[i].metric(res.capitalize(), cnt)
 
             # ── Sección 3: Consultar ──────────────────────────────────────────
