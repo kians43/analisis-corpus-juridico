@@ -349,7 +349,9 @@ if "ia_resultados_consulta" not in st.session_state:
 if "esquema_guardado" not in st.session_state:
     st.session_state.esquema_guardado = {}
 if "confirmados" not in st.session_state:
-    st.session_state.confirmados = {}   # {patron_key: set(nombres_doc)}
+    st.session_state.confirmados = {}   # {patron_desc: set(nombres_doc)}
+if "busquedas" not in st.session_state:
+    st.session_state.busquedas = {}     # {patron_desc: {nombre_doc: bool}}
 
 with st.sidebar:
     # ── Paso 1 ───────────────────────────────────────────────────────────────
@@ -378,28 +380,7 @@ with st.sidebar:
     st.markdown("---")
 
     # ── Paso 2 ───────────────────────────────────────────────────────────────
-    st.markdown("### Paso 2 · Define tu patrón")
-    st.caption(
-        "Describe en una sola frase el fenómeno que quieres detectar. "
-        "Claude lo buscará en cada documento. Puedes añadir más patrones "
-        "después sin perder el índice ya construido."
-    )
-    patron_txt = st.text_input(
-        "Patrón a detectar:",
-        placeholder="Ej: El documento omite justificar una decisión clave",
-        key="patron_txt",
-        help="Describe en lenguaje natural el fenómeno que quieres detectar."
-    )
-    patrones_lista = [patron_txt.strip()] if patron_txt.strip() else []
-    if patrones_lista:
-        st.caption("✅ Patrón listo para indexar")
-    else:
-        st.caption("⚠️ Define un patrón antes de indexar.")
-
-    st.markdown("---")
-
-    # ── Paso 3 ───────────────────────────────────────────────────────────────
-    st.markdown("### Paso 3 · Carga tu corpus")
+    st.markdown("### Paso 2 · Carga tu corpus")
     archivos_subidos = st.file_uploader(
         "Archivos TXT",
         type=["txt"],
@@ -562,50 +543,45 @@ def identificar_referencias(texto, patrones_custom):
 
 
 
-def construir_esquema(patrones):
-    """Convierte lista de descripciones en dict {clave: descripcion}."""
-    return {f"patron_{i+1}": desc for i, desc in enumerate(patrones)}
-
-
-def indexar_documento(nombre, texto, ak, esquema, tipo_corpus="documentos"):
+def indexar_documento(nombre, texto, ak, tipo_corpus="documentos"):
     """
-    Extrae el JSON estructurado de un documento con Claude.
-    esquema      = {"patron_1": "descripción…", …}
-    tipo_corpus  = descripción del tipo de documentos (contexto para Claude)
+    Lee el documento UNA SOLA VEZ y genera un resumen rico independiente de patrones.
+    Este resumen se reutiliza para todas las búsquedas de patrones posteriores.
     Usa los primeros 6 000 caracteres para minimizar costo.
     """
     h        = hashlib.md5(texto.encode("utf-8")).hexdigest()
     extracto = texto[:6000]
+    ctx      = tipo_corpus.strip() if tipo_corpus.strip() else "documentos"
 
-    campos_str = "\n".join(
-        f'  "{k}": bool,   // ¿{v}?'
-        for k, v in esquema.items()
-    )
-    ctx = tipo_corpus.strip() if tipo_corpus.strip() else "documentos"
     prompt = (
-        f"Eres un asistente de análisis de {ctx}. "
-        "Analiza el siguiente documento y responde ÚNICAMENTE con un objeto JSON.\n\n"
-        "El JSON debe tener exactamente estas claves:\n"
+        f"Eres un asistente experto en análisis de documentos jurídicos.\n"
+        f"El investigador está trabajando con: {ctx}.\n\n"
+        "Analiza el siguiente documento y genera un resumen estructurado lo más rico posible.\n"
+        "Responde ÚNICAMENTE con un objeto JSON con exactamente estas claves:\n"
         "{\n"
-        f"{campos_str}\n"
-        '  "resolucion": "resultado principal del documento en 5 palabras",\n'
-        '  "resumen": "máximo 2 oraciones del contenido"\n'
+        '  "tipo_documento": "tipo de documento jurídico (sentencia, contrato, laudo, resolución, dictamen, etc.)",\n'
+        '  "conclusion_principal": "decisión, fallo o conclusión principal del documento en máximo 8 palabras",\n'
+        '  "resolucion": "mismo que conclusion_principal, para compatibilidad",\n'
+        '  "resumen": "3-4 oraciones que describan: qué tipo de documento es, cuál es su objeto o materia, cuáles son los argumentos o fundamentos centrales, y cuál es el resultado o posición adoptada",\n'
+        '  "actores": "partes, autoridades, instituciones, personas o entidades principales mencionadas en el documento",\n'
+        '  "referencias_normativas": "leyes, artículos, normas, criterios jurisprudenciales o instrumentos citados en el documento",\n'
+        '  "temas_juridicos": "temas, figuras jurídicas, derechos o conceptos legales centrales del documento",\n'
+        '  "argumentacion": "descripción detallada del razonamiento jurídico empleado: cómo se justifican las decisiones, qué lógica argumentativa se sigue, qué evidencias o pruebas se consideran, qué omisiones o irregularidades destacan (3-4 oraciones)"\n'
         "}\n\n"
-        "Reglas estrictas: bool → true o false (minúsculas); "
-        "cadenas vacías → \"\"; sin texto antes ni después del JSON.\n\n"
+        "Reglas: adapta el análisis al tipo de documento; cadenas vacías → \"\"; "
+        "sin texto antes ni después del JSON.\n\n"
         f"Documento (primeros 6 000 caracteres):\n\"\"\"\n{extracto}\n\"\"\""
     )
     headers = {"Content-Type": "application/json",
                "x-api-key": ak, "anthropic-version": "2023-06-01"}
-    body    = {"model": CLAUDE_HAIKU, "max_tokens": 600,
+    body    = {"model": CLAUDE_HAIKU, "max_tokens": 900,
                "messages": [{"role": "user", "content": prompt}]}
     datos = {}
-    for intento in range(4):          # hasta 3 reintentos
+    for intento in range(4):
         try:
             r = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=45)
-            if r.status_code == 429:  # rate limit: espera y reintenta
-                espera = 30 * (intento + 1)
-                time.sleep(espera)
+            if r.status_code == 429:
+                time.sleep(30 * (intento + 1))
                 continue
             r.raise_for_status()
             raw   = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
@@ -621,13 +597,13 @@ def indexar_documento(nombre, texto, ak, esquema, tipo_corpus="documentos"):
     return datos
 
 
-def indexar_corpus_paralelo(corpus, ak, esquema, tipo_corpus="documentos", cb_progreso=None):
-    """Indexa todo el corpus en paralelo con ThreadPoolExecutor (IA_WORKERS hilos)."""
+def indexar_corpus_paralelo(corpus, ak, tipo_corpus="documentos", cb_progreso=None):
+    """Indexa todo el corpus con ThreadPoolExecutor (IA_WORKERS hilos)."""
     resultado   = {}
     total       = len(corpus)
     completados = 0
     with ThreadPoolExecutor(max_workers=IA_WORKERS) as ex:
-        futures = {ex.submit(indexar_documento, n, t, ak, esquema, tipo_corpus): n
+        futures = {ex.submit(indexar_documento, n, t, ak, tipo_corpus): n
                    for n, t in corpus.items()}
         for f in as_completed(futures):
             nombre       = futures[f]
@@ -639,6 +615,73 @@ def indexar_corpus_paralelo(corpus, ak, esquema, tipo_corpus="documentos", cb_pr
             except Exception as e:
                 resultado[nombre] = {"_documento": nombre, "_error": str(e)}
     return resultado
+
+
+def buscar_patron_en_indice(indice, patron, ak, tipo_corpus="documentos"):
+    """
+    Busca un patrón en el índice ya construido SIN releer los documentos originales.
+    Envía los resúmenes en lotes de 25 a Claude y pregunta cuáles coinciden.
+    Devuelve dict {nombre_doc: True/False}.
+    """
+    if not indice:
+        return {}
+
+    ctx = tipo_corpus.strip() if tipo_corpus.strip() else "documentos"
+    validos = [(n, d) for n, d in indice.items() if "_error" not in d]
+    LOTE = 25
+    resultados = {}
+
+    for i in range(0, len(validos), LOTE):
+        lote = validos[i:i + LOTE]
+        fichas = []
+        for nombre, datos in lote:
+            fichas.append({
+                "doc"                  : nombre,
+                "tipo_documento"       : datos.get("tipo_documento", ""),
+                "conclusion_principal" : datos.get("conclusion_principal", datos.get("resolucion", "")),
+                "resumen"              : datos.get("resumen", ""),
+                "actores"              : datos.get("actores", ""),
+                "referencias_normativas": datos.get("referencias_normativas", ""),
+                "temas_juridicos"      : datos.get("temas_juridicos", datos.get("temas", "")),
+                "argumentacion"        : datos.get("argumentacion", datos.get("patrones_razonamiento", "")),
+            })
+        fichas_str = json.dumps(fichas, ensure_ascii=False)
+        prompt = (
+            f"Eres un asistente de investigación experto en {ctx}.\n\n"
+            f"El investigador busca documentos que muestren el siguiente patrón:\n"
+            f"\"{patron}\"\n\n"
+            "A continuación hay fichas con el resumen de cada documento. "
+            "Determina cuáles muestran ese patrón basándote en los resúmenes.\n\n"
+            f"Fichas:\n{fichas_str}\n\n"
+            "Responde ÚNICAMENTE con JSON:\n"
+            "{\"resultados\": [{\"doc\": \"nombre\", \"coincide\": true}, ...]}\n"
+            "Incluye TODOS los documentos del lote con true o false. "
+            "Sin texto antes ni después del JSON."
+        )
+        headers = {"Content-Type": "application/json",
+                   "x-api-key": ak, "anthropic-version": "2023-06-01"}
+        body = {"model": CLAUDE_HAIKU, "max_tokens": 1000,
+                "messages": [{"role": "user", "content": prompt}]}
+        for intento in range(3):
+            try:
+                r = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=45)
+                if r.status_code == 429:
+                    time.sleep(30 * (intento + 1))
+                    continue
+                r.raise_for_status()
+                raw = r.json()["content"][0]["text"].strip().strip("```json").strip("```").strip()
+                parsed = json.loads(raw)
+                for entry in parsed.get("resultados", []):
+                    resultados[entry["doc"]] = bool(entry.get("coincide", False))
+                break
+            except Exception:
+                if intento == 2:
+                    # Si falla el lote, marcar todos como False
+                    for nombre, _ in lote:
+                        resultados[nombre] = False
+                else:
+                    time.sleep(10)
+    return resultados
 
 
 def consultar_indice(indice, consulta, ak):
@@ -827,75 +870,51 @@ with tab4:
 with tab1:
     st.subheader("🔬 Análisis semántico de corpus")
 
-    # ── Guía visual de pasos ─────────────────────────────────────────────────
-    if not api_key or not st.session_state.corpus or not patrones_lista:
-        st.markdown("#### Para comenzar completa los siguientes pasos en el panel izquierdo:")
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(
-            f"{'✅' if api_key else '⬜'} **Paso 1**\nIngresa tu API Key"
-        )
-        c2.markdown(
-            f"{'✅' if patrones_lista else '⬜'} **Paso 2**\nDefine tus patrones"
-        )
-        c3.markdown(
-            f"{'✅' if st.session_state.corpus else '⬜'} **Paso 3**\nCarga tu corpus"
-        )
+    # ── Guía de inicio ────────────────────────────────────────────────────────
+    if not api_key or not st.session_state.corpus:
+        st.markdown("#### Para comenzar, completa los pasos en el panel izquierdo:")
+        c1, c2 = st.columns(2)
+        c1.markdown(f"{'✅' if api_key else '⬜'} **Paso 1**  \nIngresa tu API Key")
+        c2.markdown(f"{'✅' if st.session_state.corpus else '⬜'} **Paso 2**  \nCarga tu corpus")
     else:
         # ── Sección 1: Indexar ────────────────────────────────────────────────
         st.markdown("### 1 · Indexar corpus")
+        st.caption(
+            "Claude lee cada documento **una sola vez** y genera un resumen estructurado. "
+            "Ese resumen se reutiliza para todas las búsquedas de patrones posteriores — "
+            "sin costo adicional por documento. "
+            "Guarda el índice como JSON para reutilizarlo en sesiones futuras."
+        )
 
-        # Determinar si el patrón actual ya fue indexado
-        patron_actual   = patrones_lista[0] if patrones_lista else ""
-        esquema_actual_guardado = st.session_state.esquema_guardado or {}
-        patron_ya_indexado = patron_actual and (patron_actual in esquema_actual_guardado.values())
-
-        n_corp = len(st.session_state.corpus)
-        n_idx  = len(st.session_state.indice)
-        # "Pendientes" = docs no aún en el índice (para el primer patrón)
-        # o todos los docs cuando el patrón es nuevo
-        if patron_ya_indexado:
-            pendientes_btn = 0
-        else:
-            pendientes_btn = n_corp  # todos necesitan este nuevo patrón
-
-        if patron_ya_indexado:
-            st.caption(
-                "✅ Este patrón ya está en el índice. Escribe un patrón diferente "
-                "para añadir una nueva búsqueda, o carga un corpus adicional."
-            )
-        else:
-            n_patron_nuevo = len(esquema_actual_guardado) + 1
-            st.caption(
-                f"Claude analizará cada documento buscando el patrón definido "
-                f"(se guardará como **patrón {n_patron_nuevo}** en el índice). "
-                "Guarda el índice como JSON para reutilizarlo sin costo. "
-                "Puedes añadir más patrones después sin perder el índice."
-            )
+        n_corp     = len(st.session_state.corpus)
+        n_idx      = len(st.session_state.indice)
+        pendientes = n_corp - n_idx
 
         col_idx1, col_idx2, col_idx3 = st.columns(3)
-        col_idx1.metric("Docs en corpus",    n_corp)
-        col_idx2.metric("Docs indexados",    n_idx)
-        col_idx3.metric("Patrones en índice", len(esquema_actual_guardado))
+        col_idx1.metric("Docs en corpus",   n_corp)
+        col_idx2.metric("Docs indexados",   n_idx)
+        col_idx3.metric("Pendientes",       pendientes)
 
         col_b1, col_b2, col_b3 = st.columns(3)
         with col_b1:
             btn_indexar = st.button(
-                "⚡ Añadir patrón al índice" if n_idx > 0 and not patron_ya_indexado
-                else ("⚡ Indexar corpus" if not patron_ya_indexado else "✅ Ya indexado"),
+                "⚡ Indexar corpus" if pendientes == n_corp else "⚡ Indexar pendientes",
                 type="primary", use_container_width=True, key="btn_indexar",
-                disabled=(pendientes_btn == 0 or not patron_actual)
+                disabled=(pendientes == 0)
             )
         with col_b2:
             idx_file = st.file_uploader(
-                "Cargar índice guardado (JSON)", type=["json"], key="carga_indice",
-                help="Evita re-indexar subiendo un índice previo."
+                "Cargar índice (JSON)", type=["json"], key="carga_indice",
+                help="Sube un índice guardado para continuar sin re-indexar."
             )
             if idx_file:
                 try:
                     cargado = json.loads(idx_file.read().decode("utf-8"))
-                    # Recuperar esquema guardado si existe
-                    if "_esquema" in cargado:
-                        st.session_state.esquema_guardado = cargado.pop("_esquema")
+                    if "_busquedas" in cargado:
+                        saved_busq = cargado.pop("_busquedas")
+                        st.session_state.busquedas.update(saved_busq)
+                    # compatibilidad con índices viejos
+                    cargado.pop("_esquema", None)
                     st.session_state.indice = cargado
                     st.success(f"✅ Índice cargado: {len(cargado)} documentos.")
                     st.rerun()
@@ -904,7 +923,9 @@ with tab1:
         with col_b3:
             if st.session_state.indice:
                 exportable = dict(st.session_state.indice)
-                exportable["_esquema"] = construir_esquema(patrones_lista)
+                exportable["_busquedas"] = {
+                    p: dict(r) for p, r in st.session_state.busquedas.items()
+                }
                 json_bytes = json.dumps(exportable, ensure_ascii=False, indent=2).encode("utf-8")
                 st.download_button(
                     "💾 Guardar índice (JSON)",
@@ -915,75 +936,98 @@ with tab1:
                 )
 
         if btn_indexar:
-            # Calcular el siguiente número de patrón de forma incremental
-            max_n = 0
-            for k in st.session_state.esquema_guardado.keys():
-                if k.startswith("patron_"):
-                    try:
-                        max_n = max(max_n, int(k.split("_")[1]))
-                    except ValueError:
-                        pass
-            nueva_clave   = f"patron_{max_n + 1}"
-            esquema_nuevo = {nueva_clave: patron_actual}
+            pendientes_dict = {
+                n: t for n, t in st.session_state.corpus.items()
+                if n not in st.session_state.indice
+            }
+            if not pendientes_dict:
+                st.info("Todos los documentos ya están indexados.")
+            else:
+                barra = st.progress(0, text="Iniciando indexación...")
 
-            # Indexar TODOS los documentos del corpus para este nuevo patrón
-            todos_dict = dict(st.session_state.corpus)
+                def _cb(completados, total, nombre):
+                    barra.progress(
+                        completados / total,
+                        text=f"Indexando {completados}/{total}: {nombre[:55]}"
+                    )
 
-            barra = st.progress(0, text="Iniciando indexación...")
-
-            def _cb(completados, total, nombre):
-                barra.progress(
-                    completados / total,
-                    text=f"Indexando {completados}/{total}: {nombre[:55]}"
+                tipo_c = st.session_state.get("descripcion_corpus", "documentos")
+                nuevos = indexar_corpus_paralelo(pendientes_dict, api_key, tipo_c, _cb)
+                st.session_state.indice.update(nuevos)
+                barra.empty()
+                errores = sum(1 for v in nuevos.values() if "_error" in v)
+                st.success(
+                    f"✅ {len(nuevos) - errores} documentos indexados"
+                    + (f" ({errores} con error)." if errores else ".")
                 )
+                if errores:
+                    muestra = [
+                        f"{v['_documento']}: {v['_error']}"
+                        for v in nuevos.values() if "_error" in v
+                    ][:5]
+                    with st.expander(f"Ver errores ({min(5, errores)} de {errores})"):
+                        for e in muestra:
+                            st.code(e)
 
-            tipo_c = st.session_state.get("descripcion_corpus", "documentos")
-            nuevos = indexar_corpus_paralelo(todos_dict, api_key, esquema_nuevo, tipo_c, _cb)
-
-            # Fusión incremental: solo actualizar la nueva clave de patrón
-            # preservando resumen/resolucion y patrones anteriores
-            for nombre, datos in nuevos.items():
-                if nombre in st.session_state.indice:
-                    # Doc ya existía: solo añadir la nueva clave de patrón
-                    st.session_state.indice[nombre][nueva_clave] = datos.get(nueva_clave)
-                else:
-                    # Doc nuevo: guardar todo
-                    st.session_state.indice[nombre] = datos
-
-            # Actualizar el esquema de forma acumulativa
-            st.session_state.esquema_guardado[nueva_clave] = patron_actual
-
-            barra.empty()
-            errores = sum(1 for v in nuevos.values() if "_error" in v)
-            st.success(
-                f"✅ Patrón «{patron_actual[:60]}» indexado en {len(nuevos) - errores} documentos"
-                + (f" ({errores} con error)." if errores else ".")
-            )
-            if errores:
-                muestra = [
-                    f"{v['_documento']}: {v['_error']}"
-                    for v in nuevos.values() if "_error" in v
-                ][:5]
-                with st.expander(f"Ver primeros errores ({min(5,errores)} de {errores})"):
-                    for e in muestra:
-                        st.code(e)
-
-        # ── Sección 2: Frecuencias ────────────────────────────────────────────
+        # ── A partir de aquí solo si hay índice ──────────────────────────────
         if st.session_state.indice:
-            esquema_viz = st.session_state.esquema_guardado or construir_esquema(patrones_lista)
             validos = [v for v in st.session_state.indice.values() if "_error" not in v]
             n_val   = len(validos)
 
-            if n_val and esquema_viz:
+            # ── Sección 2: Buscar patrón ──────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 2 · Buscar un patrón en el corpus")
+            st.caption(
+                "Describe el fenómeno que quieres detectar. "
+                "Claude comparará tu descripción contra los resúmenes ya guardados en el índice — "
+                "sin releer los documentos originales. "
+                "Puedes hacer tantas búsquedas como necesites sobre el mismo índice."
+            )
+
+            col_pat1, col_pat2 = st.columns([5, 1])
+            with col_pat1:
+                nuevo_patron = st.text_input(
+                    "Patrón a buscar:",
+                    placeholder="Ej: Casos donde la autoridad no respondió el escrito del particular",
+                    key="nuevo_patron_input"
+                )
+            with col_pat2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                btn_buscar = st.button(
+                    "🔍 Buscar", type="primary",
+                    use_container_width=True, key="btn_buscar_patron"
+                )
+
+            if btn_buscar:
+                if not nuevo_patron.strip():
+                    st.error("Escribe un patrón para buscar.")
+                elif nuevo_patron.strip() in st.session_state.busquedas:
+                    st.info("Este patrón ya fue buscado. Puedes verlo en las secciones de abajo.")
+                else:
+                    with st.spinner(f"Buscando patrón en {n_val} documentos del índice..."):
+                        tipo_c = st.session_state.get("descripcion_corpus", "documentos")
+                        resultados_patron = buscar_patron_en_indice(
+                            st.session_state.indice, nuevo_patron.strip(), api_key, tipo_c
+                        )
+                    st.session_state.busquedas[nuevo_patron.strip()] = resultados_patron
+                    n_enc = sum(1 for v in resultados_patron.values() if v)
+                    st.success(
+                        f"✅ Patrón encontrado en {n_enc} de {len(resultados_patron)} documentos."
+                    )
+                    st.rerun()
+
+            # ── Sección 3: Frecuencias ────────────────────────────────────────
+            if st.session_state.busquedas:
                 st.markdown("---")
-                st.markdown("### 2 · Frecuencias de patrones")
+                st.markdown("### 3 · Frecuencias de patrones buscados")
                 filas_freq = []
-                for clave, descripcion in esquema_viz.items():
-                    cuenta = sum(1 for v in validos if v.get(clave) is True)
+                for pat_desc, pat_res in st.session_state.busquedas.items():
+                    cuenta  = sum(1 for v in pat_res.values() if v)
+                    total_b = len(pat_res)
                     filas_freq.append({
-                        "Patrón"       : descripcion,
+                        "Patrón"       : pat_desc,
                         "Documentos"   : cuenta,
-                        "% del corpus" : f"{cuenta/n_val*100:.1f}%",
+                        "% del corpus" : f"{cuenta/total_b*100:.1f}%" if total_b else "—",
                     })
                 st.dataframe(
                     pd.DataFrame(filas_freq).sort_values("Documentos", ascending=False),
@@ -994,115 +1038,113 @@ with tab1:
                     r = str(v.get("resolucion", "otro"))[:30]
                     resoluciones[r] = resoluciones.get(r, 0) + 1
                 top_res = sorted(resoluciones.items(), key=lambda x: -x[1])[:5]
-                cols_res = st.columns(len(top_res))
-                for i, (res, cnt) in enumerate(top_res):
-                    cols_res[i].metric(res.capitalize(), cnt)
+                if top_res:
+                    cols_res = st.columns(len(top_res))
+                    for i, (res, cnt) in enumerate(top_res):
+                        cols_res[i].metric(res.capitalize(), cnt)
 
-            # ── Sección 3: Validar hallazgos ─────────────────────────────────
-            st.markdown("---")
-            st.markdown("### 3 · Validar hallazgos por patrón")
-            st.caption(
-                "Selecciona un patrón, revisa cada documento detectado y "
-                "palomea los que confirmas. El total validado es tu cifra definitiva."
-            )
+            # ── Sección 4: Validar hallazgos ──────────────────────────────────
+            if st.session_state.busquedas:
+                st.markdown("---")
+                st.markdown("### 4 · Validar hallazgos por patrón")
+                st.caption(
+                    "Selecciona un patrón, revisa los documentos donde la IA lo detectó "
+                    "y palomea los que confirmas. El total validado es tu cifra definitiva."
+                )
 
-            if esquema_viz and validos:
-                opciones_patron = {
-                    desc: clave for clave, desc in esquema_viz.items()
-                }
                 patron_sel_desc = st.selectbox(
                     "Patrón a validar:",
-                    list(opciones_patron.keys()),
+                    list(st.session_state.busquedas.keys()),
                     key="sel_patron_validar"
                 )
-                patron_sel_clave = opciones_patron[patron_sel_desc]
-
-                # Documentos donde la IA detectó este patrón
-                docs_detectados = [
-                    v for v in validos if v.get(patron_sel_clave) is True
+                resultados_sel       = st.session_state.busquedas[patron_sel_desc]
+                docs_det_nombres     = [n for n, v in resultados_sel.items() if v]
+                docs_detectados      = [
+                    st.session_state.indice[n]
+                    for n in docs_det_nombres
+                    if n in st.session_state.indice and "_error" not in st.session_state.indice[n]
                 ]
 
-                # Inicializar set de confirmados para este patrón
-                if patron_sel_clave not in st.session_state.confirmados:
-                    st.session_state.confirmados[patron_sel_clave] = set()
-                confirmados_set = st.session_state.confirmados[patron_sel_clave]
+                if patron_sel_desc not in st.session_state.confirmados:
+                    st.session_state.confirmados[patron_sel_desc] = set()
+                confirmados_set = st.session_state.confirmados[patron_sel_desc]
 
-                # Métricas resumen
                 n_det  = len(docs_detectados)
                 n_conf = len(confirmados_set)
                 mc1, mc2, mc3, mc4 = st.columns([2, 2, 2, 2])
                 mc1.metric("Detectados por IA", n_det)
-                mc2.metric("Confirmados", n_conf)
+                mc2.metric("Confirmados",       n_conf)
                 mc3.metric("Precisión", f"{n_conf/n_det*100:.0f}%" if n_det else "—")
                 with mc4:
-                    if st.button("🔄 Nueva búsqueda", use_container_width=True,
+                    if st.button("🔄 Limpiar validación", use_container_width=True,
                                  key="btn_limpiar_validacion",
-                                 help="Limpia las palomitas de este patrón para empezar la validación desde cero. El índice se conserva."):
-                        st.session_state.confirmados[patron_sel_clave] = set()
+                                 help="Limpia las palomitas. El índice y las búsquedas se conservan."):
+                        st.session_state.confirmados[patron_sel_desc] = set()
                         st.rerun()
 
                 if not docs_detectados:
-                    st.info("La IA no detectó este patrón en ningún documento.")
+                    st.info("La IA no detectó este patrón en ningún documento del índice.")
                 else:
                     st.markdown(f"**{n_det} documento(s) detectados** — palomea los que confirmas:")
                     st.markdown("")
-
                     for doc_ficha in docs_detectados:
-                        nombre_doc = doc_ficha.get("_documento", "")
-                        resumen    = doc_ficha.get("resumen", "")
-                        resolucion = doc_ficha.get("resolucion", "")
-                        confirmado = nombre_doc in confirmados_set
-
+                        nombre_doc   = doc_ficha.get("_documento", "")
+                        resumen      = doc_ficha.get("resumen", "")
+                        argumentacion = doc_ficha.get("argumentacion", doc_ficha.get("patrones_razonamiento", ""))
+                        conclusion   = doc_ficha.get("conclusion_principal", doc_ficha.get("resolucion", ""))
+                        tipo_doc     = doc_ficha.get("tipo_documento", "")
+                        confirmado   = nombre_doc in confirmados_set
                         col_chk, col_info = st.columns([1, 8])
                         with col_chk:
                             checked = st.checkbox(
                                 "✓", value=confirmado,
-                                key=f"chk_{patron_sel_clave}_{nombre_doc}"
+                                key=f"chk_{hash(patron_sel_desc)}_{nombre_doc}"
                             )
                             if checked and nombre_doc not in confirmados_set:
-                                st.session_state.confirmados[patron_sel_clave].add(nombre_doc)
+                                st.session_state.confirmados[patron_sel_desc].add(nombre_doc)
                                 st.rerun()
                             elif not checked and nombre_doc in confirmados_set:
-                                st.session_state.confirmados[patron_sel_clave].discard(nombre_doc)
+                                st.session_state.confirmados[patron_sel_desc].discard(nombre_doc)
                                 st.rerun()
                         with col_info:
+                            tipo_tag = f'<span style="color:#6B7E92;font-size:0.72rem;text-transform:uppercase;letter-spacing:.05em;">{html.escape(tipo_doc)}</span>  ' if tipo_doc else ""
                             st.markdown(
                                 f'<div style="background:{"#1a3a1a" if confirmado else "#1E2D40"};'
                                 f'border-left:4px solid {"#4CAF50" if confirmado else "#C8622A"};'
                                 f'padding:10px 14px;border-radius:6px;margin-bottom:6px;">'
-                                f'<span style="color:#A89A8E;font-size:0.78rem;">{nombre_doc}</span><br>'
+                                f'<span style="color:#A89A8E;font-size:0.78rem;">{nombre_doc}</span>  {tipo_tag}<br>'
                                 f'<span style="color:#F0EBE3;font-size:0.88rem;">{html.escape(resumen)}</span><br>'
-                                f'<span style="color:#C8622A;font-size:0.78rem;">→ {html.escape(resolucion)}</span>'
+                                + (f'<span style="color:#A89A8E;font-size:0.82rem;font-style:italic;">{html.escape(argumentacion)}</span><br>' if argumentacion else "")
+                                + f'<span style="color:#C8622A;font-size:0.78rem;">→ {html.escape(conclusion)}</span>'
                                 f'</div>',
                                 unsafe_allow_html=True
                             )
 
-                    # Exportar validación
                     st.markdown("")
                     filas_val = []
                     for doc_ficha in docs_detectados:
                         nd = doc_ficha.get("_documento", "")
                         filas_val.append({
-                            "documento"          : nd,
-                            "resumen"            : doc_ficha.get("resumen", ""),
-                            "resolucion"         : doc_ficha.get("resolucion", ""),
-                            "detectado_ia"       : "Sí",
+                            "documento"              : nd,
+                            "resumen"                : doc_ficha.get("resumen", ""),
+                            "resolucion"             : doc_ficha.get("resolucion", ""),
+                            "detectado_ia"           : "Sí",
                             "confirmado_investigador": "Sí" if nd in confirmados_set else "No",
                         })
                     csv_val = pd.DataFrame(filas_val).to_csv(
                         index=False, encoding="utf-8-sig"
                     ).encode("utf-8-sig")
                     st.download_button(
-                        f"⬇️ Exportar validación — {patron_sel_desc[:40]} (CSV)",
+                        f"⬇️ Exportar validación — {patron_sel_desc[:50]} (CSV)",
                         data=csv_val,
-                        file_name=f"validacion_{patron_sel_clave}.csv",
+                        file_name="validacion_patron.csv",
                         mime="text/csv",
                         use_container_width=True
                     )
 
-            # ── Sección 4: Ver texto original ────────────────────────────────
+            # ── Sección 5: Leer documento completo ────────────────────────────
             st.markdown("---")
-            st.markdown("### 4 · Leer documento completo")
+            st.markdown("### 5 · Leer documento completo")
             st.caption("Selecciona cualquier documento indexado para leer su texto completo y corroborar los hallazgos.")
 
             todos_indexados = sorted(st.session_state.indice.keys())
