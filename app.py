@@ -365,29 +365,28 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("📂 Corpus")
-    if st.button("📥 Cargar TXT", use_container_width=True):
-        carpeta = Path(CARPETA_TXT)
-        if not carpeta.exists():
-            st.error(f"No se encuentra la carpeta:\n{CARPETA_TXT}")
-        else:
-            archivos = list(carpeta.glob("*.txt"))
-            if not archivos:
-                st.error("No se encontraron archivos .txt en esa carpeta.")
-            else:
-                corpus_temp = {}
-                barra = st.progress(0, text="Cargando archivos...")
-                total = len(archivos)
-                for i, archivo in enumerate(archivos):
-                    try:
-                        texto = archivo.read_text(encoding="utf-8", errors="ignore")
-                        corpus_temp[archivo.name] = texto
-                    except Exception:
-                        pass
-                    barra.progress((i + 1) / total, text=f"Cargando {i+1}/{total}...")
-                st.session_state.corpus = corpus_temp
-                st.success(f"✅ {len(corpus_temp)} documentos cargados")
+    archivos_subidos = st.file_uploader(
+        "Sube tus archivos TXT",
+        type=["txt"],
+        accept_multiple_files=True,
+        help="Selecciona uno o varios archivos .txt para cargar tu corpus."
+    )
+    if archivos_subidos:
+        corpus_temp = {}
+        for archivo in archivos_subidos:
+            try:
+                texto = archivo.read().decode("utf-8", errors="ignore")
+                corpus_temp[archivo.name] = texto
+            except Exception:
+                pass
+        if corpus_temp:
+            st.session_state.corpus = corpus_temp
+            st.success(f"✅ {len(corpus_temp)} documentos cargados")
     if st.session_state.corpus:
         st.info(f"📄 {len(st.session_state.corpus)} documentos en memoria")
+        if st.button("🗑️ Limpiar corpus", use_container_width=True):
+            st.session_state.corpus = {}
+            st.rerun()
     st.markdown("---")
     st.header("🗂️ Sets guardados")
     if st.session_state.sets:
