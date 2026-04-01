@@ -3,6 +3,7 @@ import os
 import re
 import json
 import html
+import hashlib
 import requests
 import pandas as pd
 from pathlib import Path
@@ -335,6 +336,12 @@ if "revisados" not in st.session_state:
     st.session_state.revisados = set()
 if "ultimo_resultado" not in st.session_state:
     st.session_state.ultimo_resultado = None
+if "ia_cache" not in st.session_state:
+    st.session_state.ia_cache = {}
+if "ia_resultados" not in st.session_state:
+    st.session_state.ia_resultados = []
+if "ia_revisados" not in st.session_state:
+    st.session_state.ia_revisados = set()
 
 with st.sidebar:
     st.header("⚙️ Configuración")
@@ -519,6 +526,78 @@ def identificar_referencias(texto, patrones_custom):
     return sorted(list(encontrados))
 
 
+# ── Funciones de detección IA ────────────────────────────────────────────────
+
+def dividir_texto(texto, tamaño=1200):
+    """Divide el texto en fragmentos de tamaño fijo para enviar a Claude."""
+    return [texto[i:i+tamaño] for i in range(0, len(texto), tamaño)]
+
+
+def filtrar_documentos(corpus, palabras_clave):
+    """Pre-filtro por palabras clave antes de llamar a la IA (sin costo de API)."""
+    if not palabras_clave:
+        return list(corpus.keys())
+    palabras_lower = [p.lower().strip() for p in palabras_clave if p.strip()]
+    return [nombre for nombre, texto in corpus.items()
+            if any(p in texto.lower() for p in palabras_lower)]
+
+
+def evaluar_chunk_con_ia(chunk, ak):
+    """Envía un fragmento a Claude y pregunta si contiene la omisión buscada."""
+    prompt = f"""Eres un asistente de análisis jurídico.
+Responde SOLO en JSON válido, sin texto adicional.
+
+¿Este texto contiene un caso donde el juez NO transcribe los conceptos de violación o agravios?
+
+Criterios de inclusión:
+* El juez declara que es innecesario transcribir los conceptos de violación o agravios
+* El juez omite la transcripción sin justificación expresa
+
+Criterios de exclusión:
+* El juez sí transcribe los conceptos de violación o agravios
+* Solo se menciona el término sin aplicarlo al caso concreto
+
+Formato de respuesta (JSON puro):
+{{"match": true/false, "fragmento": "cita textual breve del pasaje relevante, o cadena vacía si no hay match"}}
+
+Texto a analizar:
+\"\"\"{chunk}\"\"\""""
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": ak,
+        "anthropic-version": "2023-06-01"
+    }
+    body = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    try:
+        r = requests.post(CLAUDE_URL, headers=headers, json=body, timeout=30)
+        r.raise_for_status()
+        raw = r.json()["content"][0]["text"].strip()
+        limpia = raw.strip("```json").strip("```").strip()
+        return json.loads(limpia)
+    except Exception:
+        return {"match": False, "fragmento": ""}
+
+
+def procesar_documento(nombre, texto, ak, cache):
+    """Procesa un documento completo con early-stop y caché por hash."""
+    h = hashlib.md5(texto.encode("utf-8")).hexdigest()
+    if h in cache:
+        return cache[h]
+    for chunk in dividir_texto(texto):
+        resultado = evaluar_chunk_con_ia(chunk, ak)
+        if resultado.get("match"):
+            res = {"match": True, "fragmento": resultado.get("fragmento", "")}
+            cache[h] = res
+            return res
+    res = {"match": False, "fragmento": ""}
+    cache[h] = res
+    return res
+
+
 def guardar_set(resultados):
     nombre = f"SET_{st.session_state.set_counter}"
     st.session_state.sets[nombre] = resultados
@@ -542,8 +621,8 @@ def exportar_csv(nombres, corpus, terminos):
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🔍 Búsqueda", "📊 Estadísticas", "🔗 Referencias", "📋 Historial"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🔍 Búsqueda", "📊 Estadísticas", "🔗 Referencias", "📋 Historial", "🤖 Detección IA"]
 )
 
 # ── TAB 1: BÚSQUEDA ─────────────────────────────────────────────────────────
@@ -836,3 +915,166 @@ with tab4:
         if st.button("🗑️ Limpiar historial"):
             st.session_state.historial = []
             st.rerun()
+
+# ── TAB 5: DETECCIÓN IA ──────────────────────────────────────────────────────
+with tab5:
+    st.subheader("🤖 Detección asistida por IA")
+    st.caption(
+        "Detecta automáticamente sentencias donde el juez **omite transcribir** "
+        "los conceptos de violación o agravios. Claude analiza cada documento "
+        "fragmento por fragmento y se detiene en cuanto encuentra el patrón."
+    )
+
+    if not st.session_state.corpus:
+        st.warning("⬅️ Primero carga los TXT desde el panel izquierdo.")
+    elif not api_key:
+        st.warning("⬅️ Ingresa tu API Key en el panel izquierdo.")
+    else:
+        col_ia1, col_ia2 = st.columns([2, 1])
+        with col_ia1:
+            palabras_prefilter = st.text_area(
+                "Palabras clave para pre-filtrar (opcional):",
+                placeholder=(
+                    "innecesario transcribir\n"
+                    "conceptos de violación\n"
+                    "agravios\n"
+                    "omite transcripción"
+                ),
+                height=120,
+                key="ia_palabras_clave",
+                help=(
+                    "Solo los documentos que contengan al menos una de estas palabras "
+                    "se enviarán a Claude. Reduce costos de API sin perder precisión."
+                )
+            )
+        with col_ia2:
+            st.markdown("**ℹ️ Cómo funciona**")
+            st.markdown(
+                "1. Pre-filtra por palabras clave (gratis)\n"
+                "2. Divide cada doc en fragmentos de ~1 200 chars\n"
+                "3. Envía fragmento por fragmento a Claude\n"
+                "4. Para en cuanto detecta el patrón\n"
+                "5. Cachea resultados para no reprocesar"
+            )
+
+        col_run1, col_run2 = st.columns(2)
+        with col_run1:
+            btn_analizar = st.button(
+                "🔍 Analizar corpus", type="primary", use_container_width=True,
+                key="btn_ia_analizar"
+            )
+        with col_run2:
+            btn_limpiar_cache = st.button(
+                "🗑️ Limpiar caché IA", use_container_width=True,
+                key="btn_ia_limpiar_cache"
+            )
+
+        if btn_limpiar_cache:
+            st.session_state.ia_cache = {}
+            st.session_state.ia_resultados = []
+            st.session_state.ia_revisados = set()
+            st.success("Caché limpiada.")
+            st.rerun()
+
+        if btn_analizar:
+            kw_lista = [
+                kw.strip() for kw in palabras_prefilter.splitlines() if kw.strip()
+            ]
+            docs_candidatos = filtrar_documentos(st.session_state.corpus, kw_lista)
+
+            if not docs_candidatos:
+                st.warning("El pre-filtro no encontró documentos candidatos. "
+                           "Deja el campo en blanco para analizar todo el corpus.")
+            else:
+                st.info(
+                    f"Pre-filtro: **{len(docs_candidatos)}** documentos candidatos "
+                    f"de {len(st.session_state.corpus)} totales."
+                )
+                progreso = st.progress(0, text="Iniciando análisis...")
+                resultados_ia = []
+                total = len(docs_candidatos)
+
+                for i, nombre in enumerate(docs_candidatos):
+                    progreso.progress(
+                        (i + 1) / total,
+                        text=f"Analizando {i+1}/{total}: {nombre[:50]}"
+                    )
+                    texto = st.session_state.corpus[nombre]
+                    res = procesar_documento(
+                        nombre, texto, api_key, st.session_state.ia_cache
+                    )
+                    if res["match"]:
+                        resultados_ia.append({
+                            "documento": nombre,
+                            "fragmento": res["fragmento"],
+                            "revisado" : nombre in st.session_state.ia_revisados
+                        })
+
+                progreso.empty()
+                st.session_state.ia_resultados = resultados_ia
+                st.success(
+                    f"✅ Análisis completo. "
+                    f"**{len(resultados_ia)}** documento(s) con el patrón detectado."
+                )
+
+        # ── Visor de resultados IA ─────────────────────────────────────────────
+        if st.session_state.ia_resultados:
+            st.markdown("---")
+            st.markdown(
+                f"### {len(st.session_state.ia_resultados)} documento(s) detectados"
+            )
+
+            for idx, item in enumerate(st.session_state.ia_resultados):
+                nombre_doc = item["documento"]
+                fragmento  = item["fragmento"]
+                revisado   = nombre_doc in st.session_state.ia_revisados
+
+                with st.expander(
+                    f"{'✅' if revisado else '🔴'} {nombre_doc}",
+                    expanded=not revisado
+                ):
+                    if fragmento:
+                        st.markdown("**Fragmento detectado:**")
+                        st.markdown(
+                            f'<div style="background:#1E2D40;border-left:4px solid #C8622A;'
+                            f'padding:12px 16px;border-radius:6px;font-family:monospace;'
+                            f'font-size:0.85rem;color:#F0EBE3;white-space:pre-wrap;">'
+                            f'{html.escape(fragmento)}</div>',
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.caption("_(Claude detectó el patrón pero no extrajo fragmento)_")
+
+                    st.markdown("")
+                    if revisado:
+                        st.success("✅ Marcado como revisado")
+                    else:
+                        if st.button(
+                            "✅ Marcar como revisado",
+                            key=f"ia_marcar_{idx}",
+                            type="primary"
+                        ):
+                            st.session_state.ia_revisados.add(nombre_doc)
+                            st.rerun()
+
+            # ── Exportar CSV de detección IA ──────────────────────────────────
+            st.markdown("---")
+            filas_ia = []
+            for item in st.session_state.ia_resultados:
+                filas_ia.append({
+                    "documento"                 : item["documento"],
+                    "fragmento_detectado"       : item["fragmento"],
+                    "match_ia"                  : True,
+                    "revisado_manualmente"      : "Sí" if item["documento"] in st.session_state.ia_revisados else "No",
+                    "validacion_investigador"   : "",
+                    "observaciones"             : "",
+                })
+            df_ia = pd.DataFrame(filas_ia)
+            csv_ia = df_ia.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Exportar resultados IA (CSV)",
+                data=csv_ia,
+                file_name="deteccion_ia_omision_conceptos.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
