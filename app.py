@@ -984,7 +984,7 @@ with tab1:
                 "Puedes hacer tantas búsquedas como necesites sobre el mismo índice."
             )
 
-            col_pat1, col_pat2 = st.columns([5, 1])
+            col_pat1, col_pat2, col_pat3 = st.columns([5, 1, 1])
             with col_pat1:
                 nuevo_patron = st.text_input(
                     "Patrón a buscar:",
@@ -997,12 +997,19 @@ with tab1:
                     "🔍 Buscar", type="primary",
                     use_container_width=True, key="btn_buscar_patron"
                 )
+            with col_pat3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🗑️ Limpiar", use_container_width=True, key="btn_limpiar_busquedas",
+                             help="Borra todos los resultados de búsqueda anteriores. El índice se conserva."):
+                    st.session_state.busquedas = {}
+                    st.session_state.confirmados = {}
+                    st.rerun()
 
             if btn_buscar:
                 if not nuevo_patron.strip():
                     st.error("Escribe un patrón para buscar.")
                 elif nuevo_patron.strip() in st.session_state.busquedas:
-                    st.info("Este patrón ya fue buscado. Puedes verlo en las secciones de abajo.")
+                    st.info("Este patrón ya fue buscado. Puedes verlo en la tabla de abajo.")
                 else:
                     with st.spinner(f"Buscando patrón en {n_val} documentos del índice..."):
                         tipo_c = st.session_state.get("descripcion_corpus", "documentos")
@@ -1020,19 +1027,32 @@ with tab1:
             if st.session_state.busquedas:
                 st.markdown("---")
                 st.markdown("### 3 · Frecuencias de patrones buscados")
-                filas_freq = []
-                for pat_desc, pat_res in st.session_state.busquedas.items():
+
+                # Tabla con botón de eliminar por fila
+                for pat_desc, pat_res in list(st.session_state.busquedas.items()):
                     cuenta  = sum(1 for v in pat_res.values() if v)
                     total_b = len(pat_res)
-                    filas_freq.append({
-                        "Patrón"       : pat_desc,
-                        "Documentos"   : cuenta,
-                        "% del corpus" : f"{cuenta/total_b*100:.1f}%" if total_b else "—",
-                    })
-                st.dataframe(
-                    pd.DataFrame(filas_freq).sort_values("Documentos", ascending=False),
-                    use_container_width=True, hide_index=True
-                )
+                    pct     = f"{cuenta/total_b*100:.1f}%" if total_b else "—"
+                    col_desc, col_docs, col_pct, col_del = st.columns([6, 1, 1, 1])
+                    col_desc.markdown(
+                        f'<div style="padding:6px 0;font-size:0.88rem;color:#F0EBE3;">{pat_desc}</div>',
+                        unsafe_allow_html=True
+                    )
+                    col_docs.markdown(
+                        f'<div style="padding:6px 0;text-align:center;font-weight:700;color:#C8622A;">{cuenta}</div>',
+                        unsafe_allow_html=True
+                    )
+                    col_pct.markdown(
+                        f'<div style="padding:6px 0;text-align:center;color:#A89A8E;">{pct}</div>',
+                        unsafe_allow_html=True
+                    )
+                    with col_del:
+                        if st.button("✕", key=f"del_pat_{hash(pat_desc)}",
+                                     help="Eliminar esta búsqueda (el índice se conserva)"):
+                            del st.session_state.busquedas[pat_desc]
+                            st.session_state.confirmados.pop(pat_desc, None)
+                            st.rerun()
+                st.divider()
                 resoluciones = {}
                 for v in validos:
                     r = str(v.get("resolucion", "otro"))[:30]
